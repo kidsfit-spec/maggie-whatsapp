@@ -47,7 +47,7 @@ MINIMAX_API_KEY = (
     "sk-api-3hXH9X2CMVPLfIIsWCGVoqcG4XQXF83T1jus6_UPu4DDW-jy4-1ctvb1a44X_-"
     "mURow51iEiV3VbNGQxMh7Pw3qjrUbIAdNTTyKJITjFhlCbaw2GxwSAQy0"
 )
-MINIMAX_VOICE_ID = "presenter_female"
+MINIMAX_VOICE_ID = "female-tianmei"
 MINIMAX_MODEL = "speech-2.8-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 
@@ -551,7 +551,7 @@ def index():
         "service": "AIRTS WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 AIRTS",
         "status": "running",
-        "version": "2.3.7",
+        "version": "2.3.8",
         "flow": "用戶發訊息 → AIRTS改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
     })
 
