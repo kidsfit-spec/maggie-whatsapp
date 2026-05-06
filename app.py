@@ -177,23 +177,24 @@ def send_whatsapp_audio(to: str, media_id: str) -> dict:
 # ─── STT（OpenAI Whisper）────────────────────────────────────────────────────
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
-    """使用 OpenAI Whisper 將音頻轉為文字"""
-    import openai
-    client = openai.OpenAI(api_key=OPENAI_API_KEY)
-
+    """使用 OpenAI Whisper API 將音頻轉為文字（直接用 requests，避免 SDK 版本衝突）"""
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name
 
     try:
         with open(tmp_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="zh"
+            resp = requests.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={"file": (f"audio{suffix}", audio_file, "audio/ogg")},
+                data={"model": "whisper-1", "language": "zh"},
+                timeout=60
             )
-        logger.info(f"[STT] 識別結果: {transcript.text[:100]}")
-        return transcript.text
+        resp.raise_for_status()
+        text = resp.json().get("text", "").strip()
+        logger.info(f"[STT] 識別結果: {text[:100]}")
+        return text
     finally:
         os.unlink(tmp_path)
 
