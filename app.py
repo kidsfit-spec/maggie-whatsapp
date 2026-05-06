@@ -47,7 +47,7 @@ MINIMAX_API_KEY = (
     "sk-api-3hXH9X2CMVPLfIIsWCGVoqcG4XQXF83T1jus6_UPu4DDW-jy4-1ctvb1a44X_-"
     "mURow51iEiV3VbNGQxMh7Pw3qjrUbIAdNTTyKJITjFhlCbaw2GxwSAQy0"
 )
-MINIMAX_VOICE_ID = "female-chengshu"
+MINIMAX_VOICE_ID = "audiobook_female_1"
 MINIMAX_MODEL = "speech-2.8-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 
@@ -556,7 +556,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.4.1",
+        "version": "2.4.2",
         "flow": "大王發訊息 → Maggie改寫 → 大王確認 → 生成粵語語音發回大王 → 大王自行轉發"
     })
 
