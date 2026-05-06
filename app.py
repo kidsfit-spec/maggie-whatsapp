@@ -72,7 +72,7 @@ conversation_history: dict[str, list] = {}
 
 # ─── AI 系統提示 ──────────────────────────────────────────────────────────────
 
-MAGGIE_SYSTEM_PROMPT = """你是 Maggie，Arts Mak 的私人溝通教練助手。Arts Mak 是 KIDS FIT 的老闆，男性，說話率直。
+MAGGIE_SYSTEM_PROMPT = """你是 AIRTS，Arts Mak 的 AI 代言人及溝通助手。Arts Mak 是 KIDS FIT 的老闆，男性，說話率直。
 
 你的任務：
 幫助 Arts 將想表達的內容改寫為友善自然的版本，準備以廣東話語音（以 AIRTS 的身份）發送給香港幼稚園的女性教育工作者（校長、主任、老師）。
@@ -383,7 +383,7 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
             send_whatsapp_text(from_number, f"語音識別失敗：{str(e)[:100]}")
             return
     else:
-        send_whatsapp_text(from_number, "Maggie 目前支援文字和語音訊息。")
+        send_whatsapp_text(from_number, "AIRTS 目前支援文字和語音訊息。")
         return
 
     if not text:
@@ -506,11 +506,11 @@ def _execute_generate_and_send_back(from_number: str):
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "service": "Maggie / AIRTS WhatsApp 溝通系統",
-        "description": "KIDS FIT AI 溝通教練 - 對內 Maggie，對外 AIRTS",
+        "service": "AIRTS WhatsApp 溝通系統",
+        "description": "KIDS FIT AI 溝通助手 AIRTS",
         "status": "running",
-        "version": "2.2.0",
-        "flow": "用戶發訊息 → Maggie改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
+        "version": "2.3.0",
+        "flow": "用戶發訊息 → AIRTS改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
     })
 
 
@@ -587,7 +587,7 @@ def test_send_text():
     """測試發送文字訊息"""
     data = request.get_json(force=True)
     to = data.get("to", "85268993194")
-    message = data.get("message", "Maggie 系統測試 - v2.2 簡化流程版")
+    message = data.get("message", "AIRTS 系統測試 - v2.3")
     try:
         result = send_whatsapp_text(to, message)
         return jsonify({"status": "ok", "result": result})
