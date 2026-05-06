@@ -56,6 +56,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 WHITELIST = {"85268993194"}
 
+# 語音自動轉發號碼（生成語音後同時發送到此號碼）
+AUTO_FORWARD_NUMBER = "85263951689"
+
 # ─── 狀態管理（in-memory）────────────────────────────────────────────────────
 
 STATE_IDLE = "idle"
@@ -524,14 +527,24 @@ def _execute_generate_and_send_back(from_number: str):
         # 上傳到 WhatsApp
         media_id = upload_whatsapp_audio(audio_bytes)
 
-        # 發送語音回給用戶
+        # 發送語音回給用戶（大王）
         result = send_whatsapp_audio(from_number, media_id)
-        logger.info(f"[SEND BACK] 結果: {result}")
+        logger.info(f"[SEND BACK to user] 結果: {result}")
+
+        # 自動轉發語音到指定號碼
+        try:
+            fwd_result = send_whatsapp_audio(AUTO_FORWARD_NUMBER, media_id)
+            logger.info(f"[AUTO FORWARD to {AUTO_FORWARD_NUMBER}] 結果: {fwd_result}")
+            fwd_ok = True
+        except Exception as fwd_e:
+            logger.error(f"[AUTO FORWARD ERROR] {fwd_e}")
+            fwd_ok = False
 
         # 通知用戶
+        fwd_status = f"，同時已自動發送到 +852 6395 1689" if fwd_ok else "，但自動轉發失敗，請手動轉發"
         send_whatsapp_text(
             from_number,
-            "大王，語音已生成！長按上面嘅語音訊息，轉發俾任何人或群組。"
+            f"大王，語音已生成{fwd_status}。"
         )
 
         # 更新對話歷史
@@ -556,7 +569,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.5.0",
+        "version": "2.5.1",
         "flow": "大王發訊息 → Maggie改寫 → 大王確認 → 生成粵語語音發回大王 → 大王自行轉發"
     })
 
