@@ -48,7 +48,7 @@ MINIMAX_API_KEY = (
     "mURow51iEiV3VbNGQxMh7Pw3qjrUbIAdNTTyKJITjFhlCbaw2GxwSAQy0"
 )
 MINIMAX_VOICE_ID = "moss_audio_044256f0-48e5-11f1-9ac6-fa4383f073f0"
-MINIMAX_MODEL = "speech-2.8-hd"
+MINIMAX_MODEL = "speech-02-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -288,10 +288,15 @@ def text_to_speech(text: str) -> bytes:
         "model": MINIMAX_MODEL,
         "text": text,
         "voice_setting": {
-            "voice_id": MINIMAX_VOICE_ID
+            "voice_id": MINIMAX_VOICE_ID,
+            "speed": 0.9,      # 略慢語速，廣東話更清晰自然
+            "vol": 1.0,        # 標準音量
+            "pitch": 0         # 原音色音調
         },
         "audio_setting": {
-            "format": "mp3"
+            "format": "mp3",
+            "sample_rate": 32000,   # 高採樣率，音質更清晰
+            "bitrate": 128000       # 128kbps，WhatsApp 語音訊息標準
         }
     }
     resp = requests.post(MINIMAX_ENDPOINT, headers=headers, json=payload, timeout=90)
@@ -545,7 +550,7 @@ def index():
         "service": "AIRTS WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 AIRTS",
         "status": "running",
-        "version": "2.3.3",
+        "version": "2.3.4",
         "flow": "用戶發訊息 → AIRTS改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
     })
 
