@@ -54,10 +54,12 @@ MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-WHITELIST = {"85268993194"}
+# 完整功能白名單：兩個號碼都有改寫+語音生成功能
+WHITELIST = {"85268993194", "85263951689"}
 
-# 語音自動轉發號碼（生成語音後同時發送到此號碼）
-AUTO_FORWARD_NUMBER = "85263951689"
+# 自動轉發設定：只有大王（85268993194）發的語音才自動轉發到此號碼
+AUTO_FORWARD_FROM = "85268993194"   # 只有這個號碼發出的語音才觸發轉發
+AUTO_FORWARD_NUMBER = "85263951689"  # 轉發目標號碼
 
 # ─── 狀態管理（in-memory）────────────────────────────────────────────────────
 
@@ -400,6 +402,21 @@ def parse_gemini_response(response: str) -> tuple:
     return response.strip(), response
 
 
+def _handle_chat_only(from_number: str, msg_type: str, msg_content: dict):
+    """普通對話白名單處理：回覆簡單訊息，保持 24 小時對話窗口"""
+    if msg_type == "text":
+        text = msg_content.get("body", "").strip().lower()
+        if any(kw in text for kw in ["ok", "好", "收到", "明白", "謝", "多謝", "唔啊", "了", "thanks", "thank"]):
+            send_whatsapp_text(from_number, "好的，收到。")
+        else:
+            send_whatsapp_text(from_number, "收到。")
+    elif msg_type == "audio":
+        send_whatsapp_text(from_number, "收到語音。")
+    else:
+        send_whatsapp_text(from_number, "收到。")
+    logger.info(f"[CHAT_ONLY] 回覆完成: {from_number}")
+
+
 # ─── 主要訊息處理邏輯（狀態機）────────────────────────────────────────────────
 
 def process_message(from_number: str, msg_type: str, msg_content: dict):
@@ -531,17 +548,20 @@ def _execute_generate_and_send_back(from_number: str):
         result = send_whatsapp_audio(from_number, media_id)
         logger.info(f"[SEND BACK to user] 結果: {result}")
 
-        # 自動轉發語音到指定號碼
-        try:
-            fwd_result = send_whatsapp_audio(AUTO_FORWARD_NUMBER, media_id)
-            logger.info(f"[AUTO FORWARD to {AUTO_FORWARD_NUMBER}] 結果: {fwd_result}")
-            fwd_ok = True
-        except Exception as fwd_e:
-            logger.error(f"[AUTO FORWARD ERROR] {fwd_e}")
-            fwd_ok = False
+        # 自動轉發：只有 AUTO_FORWARD_FROM 發出的語音才轉發
+        if from_number == AUTO_FORWARD_FROM:
+            try:
+                fwd_result = send_whatsapp_audio(AUTO_FORWARD_NUMBER, media_id)
+                logger.info(f"[AUTO FORWARD to {AUTO_FORWARD_NUMBER}] 結果: {fwd_result}")
+                fwd_ok = True
+            except Exception as fwd_e:
+                logger.error(f"[AUTO FORWARD ERROR] {fwd_e}")
+                fwd_ok = False
+            fwd_status = f"，同時已自動發送到 +852 6395 1689" if fwd_ok else "，但自動轉發失敗，請手動轉發"
+        else:
+            fwd_status = ""
 
         # 通知用戶
-        fwd_status = f"，同時已自動發送到 +852 6395 1689" if fwd_ok else "，但自動轉發失敗，請手動轉發"
         send_whatsapp_text(
             from_number,
             f"大王，語音已生成{fwd_status}。"
@@ -569,7 +589,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.5.1",
+        "version": "2.5.2",
         "flow": "大王發訊息 → Maggie改寫 → 大王確認 → 生成粵語語音發回大王 → 大王自行轉發"
     })
 
