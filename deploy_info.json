@@ -1,0 +1,10 @@
+{
+  "service_id": "srv-d7taem5ckfvc73an2stg",
+  "deploy_id": "dep-d7taemtckfvc73an2tq0",
+  "service_url": "https://maggie-whatsapp.onrender.com",
+  "dashboard_url": "https://dashboard.render.com/web/srv-d7taem5ckfvc73an2stg",
+  "webhook_url": "https://maggie-whatsapp.onrender.com/webhook/whatsapp",
+  "verify_token": "kidsfit_maggie_2024",
+  "region": "singapore",
+  "plan": "free"
+}
