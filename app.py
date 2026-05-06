@@ -27,9 +27,12 @@ import logging
 import re
 import threading
 import requests
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
+from apscheduler.schedulers.background import BackgroundScheduler
+import pytz
 
 # ─── 日誌設定 ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +71,21 @@ WHITELIST = {"85268993194", "85263951689"}
 
 # 大王號碼（接收第三方轉發通知）
 DAWANG_NUMBER = "85268993194"
+
+# Google Calendar 設定
+GCAL_CALENDAR_ID = "info@kidsfit.com.hk"
+GCAL_API_BASE = "https://www.googleapis.com/calendar/v3"
+
+# 教練 WhatsApp 號碼對照表
+COACH_NUMBERS = {
+    "可樂": "85262834191",
+    "倉鼠": "85264222428",
+    "西瓜": "85265350841",
+    "樹熊": "85251384906",
+}
+ALL_COACH_NUMBERS = list(COACH_NUMBERS.values())
+
+HK_TZ = pytz.timezone("Asia/Hong_Kong")
 
 # ─── 狀態管理（文件持久化 + 線程安全）──────────────────────────────────────────
 
@@ -818,7 +836,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.7.1",
+        "version": "2.8.0",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
@@ -916,6 +934,247 @@ def debug_state():
         "user_states": states,
         "history_counts": {k: len(v) for k, v in _load_history().items()}
     })
+
+
+# ─── Google Calendar 工具函數 ────────────────────────────────────────────────
+
+def get_google_access_token() -> str:
+    """
+    從 Render 環境變數取得 Google OAuth2 Access Token。
+    使用 GOOGLE_REFRESH_TOKEN + GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET 換取 access token。
+    如果直接有 GOOGLE_ACCESS_TOKEN 則直接使用。
+    """
+    # 優先使用直接 access token（短期）
+    direct_token = os.environ.get("GOOGLE_ACCESS_TOKEN", "")
+    if direct_token:
+        return direct_token
+
+    # 使用 refresh token 換取 access token
+    refresh_token = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+
+    if not all([refresh_token, client_id, client_secret]):
+        raise ValueError("缺少 Google OAuth2 憑證（GOOGLE_REFRESH_TOKEN / GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET）")
+
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        },
+        timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def fetch_tomorrow_events() -> list:
+    """從 Google Calendar 讀取明天的所有行程"""
+    now_hk = datetime.now(HK_TZ)
+    tomorrow_hk = now_hk + timedelta(days=1)
+    time_min = tomorrow_hk.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    time_max = tomorrow_hk.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+
+    token = get_google_access_token()
+    url = f"{GCAL_API_BASE}/calendars/{GCAL_CALENDAR_ID}/events"
+    params = {
+        "timeMin": time_min,
+        "timeMax": time_max,
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": 100,
+    }
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("items", [])
+
+
+def format_time_hk(dt_str: str) -> str:
+    """將 RFC3339 時間字串格式化為香港時間顯示，例如 '上午8:30'"""
+    if not dt_str:
+        return "未知時間"
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        dt_hk = dt.astimezone(HK_TZ)
+        hour = dt_hk.hour
+        minute = dt_hk.minute
+        period = "上午" if hour < 12 else "下午"
+        display_hour = hour if hour <= 12 else hour - 12
+        if display_hour == 0:
+            display_hour = 12
+        return f"{period}{display_hour}:{minute:02d}"
+    except Exception:
+        return dt_str[:16]
+
+
+def extract_coach_from_description(description: str) -> str:
+    """
+    從行程備註中提取教練名稱。
+    格式：「教練：XXX」
+    返回教練名稱，如果為空或找不到則返回空字串。
+    """
+    if not description:
+        return ""
+    m = re.search(r'教練[：:]+\s*([^\n\r\s]+)', description)
+    if m:
+        name = m.group(1).strip()
+        # 如果提取到的名稱是已知教練名，返回它
+        if name in COACH_NUMBERS:
+            return name
+        # 如果提取到但不在列表中，也返回（讓上層處理）
+        return name
+    return ""
+
+
+def send_daily_reminders():
+    """
+    每日下午6:00 執行：
+    1. 讀取明天行程
+    2. 根據教練名稱發送工作提示
+    3. 發完整行程給大王留底
+    """
+    logger.info("[SCHEDULER] 開始發送每日工作提示...")
+    now_hk = datetime.now(HK_TZ)
+    tomorrow_hk = now_hk + timedelta(days=1)
+    tomorrow_str = tomorrow_hk.strftime("%m月%d日")
+    weekday_names = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    tomorrow_weekday = weekday_names[tomorrow_hk.weekday()]
+
+    try:
+        events = fetch_tomorrow_events()
+    except Exception as e:
+        logger.error(f"[SCHEDULER] 讀取日曆失敗: {e}")
+        send_whatsapp_text(DAWANG_NUMBER, f"每日提示失敗：無法讀取 Google Calendar。\n錯誤：{str(e)[:100]}")
+        return
+
+    if not events:
+        send_whatsapp_text(DAWANG_NUMBER, f"大王，明天（{tomorrow_str} {tomorrow_weekday}）Google Calendar 沒有行程。")
+        logger.info("[SCHEDULER] 明天沒有行程")
+        return
+
+    # 按教練分組
+    coach_events = {}   # {coach_name: [event, ...]}
+    no_coach_events = []  # 沒有填教練的行程
+
+    for event in events:
+        summary = event.get("summary", "").strip()
+        description = event.get("description", "") or ""
+        start_dt = event.get("start", {}).get("dateTime", event.get("start", {}).get("date", ""))
+        end_dt = event.get("end", {}).get("dateTime", event.get("end", {}).get("date", ""))
+
+        coach = extract_coach_from_description(description)
+
+        event_info = {
+            "summary": summary,
+            "start": start_dt,
+            "end": end_dt,
+            "coach": coach,
+        }
+
+        if coach and coach in COACH_NUMBERS:
+            if coach not in coach_events:
+                coach_events[coach] = []
+            coach_events[coach].append(event_info)
+        else:
+            no_coach_events.append(event_info)
+
+    # 發送給各教練
+    notified_coaches = []
+
+    for coach_name, evts in coach_events.items():
+        wa_number = COACH_NUMBERS[coach_name]
+        if len(evts) == 1:
+            e = evts[0]
+            msg = (
+                f"明天工作安排（{tomorrow_str} {tomorrow_weekday}）：\n\n"
+                f"{e['summary']}\n"
+                f"時間：{format_time_hk(e['start'])} - {format_time_hk(e['end'])}\n\n"
+                f"如有任何問題，請聯絡大王。"
+            )
+        else:
+            lines = [f"明天工作安排（{tomorrow_str} {tomorrow_weekday}）：\n"]
+            for i, e in enumerate(evts, 1):
+                lines.append(
+                    f"{i}. {e['summary']}\n"
+                    f"   時間：{format_time_hk(e['start'])} - {format_time_hk(e['end'])}"
+                )
+            lines.append("\n如有任何問題，請聯絡大王。")
+            msg = "\n".join(lines)
+
+        result = send_whatsapp_text(wa_number, msg)
+        if "messages" in result:
+            notified_coaches.append(coach_name)
+            logger.info(f"[SCHEDULER] 已發送給 {coach_name}（{wa_number}）")
+        else:
+            err = result.get("error", {}).get("message", "未知錯誤")
+            logger.error(f"[SCHEDULER] 發送給 {coach_name} 失敗: {err}")
+
+    # 如有未填教練的行程，通知所有教練
+    if no_coach_events:
+        alert_msg = f"明天（{tomorrow_str} {tomorrow_weekday}）的人手分配尚未填妥，請留意稍後通知。"
+        for coach_name, wa_number in COACH_NUMBERS.items():
+            send_whatsapp_text(wa_number, alert_msg)
+            logger.info(f"[SCHEDULER] 已發送人手未填通知給 {coach_name}")
+
+    # 發完整行程給大王留底
+    summary_lines = [f"大王，以下是明天（{tomorrow_str} {tomorrow_weekday}）完整行程：\n"]
+    for event in events:
+        summary = event.get("summary", "").strip()
+        description = event.get("description", "") or ""
+        start_dt = event.get("start", {}).get("dateTime", event.get("start", {}).get("date", ""))
+        end_dt = event.get("end", {}).get("dateTime", event.get("end", {}).get("date", ""))
+        coach = extract_coach_from_description(description)
+        coach_label = f"（教練：{coach}）" if coach else "（教練：未填）"
+        summary_lines.append(
+            f"- {summary} {coach_label}\n"
+            f"  時間：{format_time_hk(start_dt)} - {format_time_hk(end_dt)}"
+        )
+
+    if notified_coaches:
+        summary_lines.append(f"\n已發送工作提示給：{', '.join(notified_coaches)}")
+    if no_coach_events:
+        summary_lines.append(f"未填教練行程：{len(no_coach_events)} 個，已通知所有教練留意。")
+
+    send_whatsapp_text(DAWANG_NUMBER, "\n".join(summary_lines))
+    logger.info(f"[SCHEDULER] 完成。已通知 {len(notified_coaches)} 位教練")
+
+
+@app.route("/admin/send-reminders", methods=["POST"])
+def manual_send_reminders():
+    """手動觸發每日提示（測試用）"""
+    try:
+        threading.Thread(target=send_daily_reminders, daemon=True).start()
+        return jsonify({"status": "ok", "message": "已觸發發送每日工作提示"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# ─── APScheduler 定時任務 ────────────────────────────────────────────────────
+
+def start_scheduler():
+    """啟動 APScheduler，每日下午6:00（香港時間）發送工作提示"""
+    scheduler = BackgroundScheduler(timezone=HK_TZ)
+    scheduler.add_job(
+        send_daily_reminders,
+        trigger="cron",
+        hour=18,
+        minute=0,
+        id="daily_reminders",
+        name="每日教練工作提示",
+        replace_existing=True,
+        misfire_grace_time=300,  # 允許5分鐘誤差
+    )
+    scheduler.start()
+    logger.info("[SCHEDULER] APScheduler 已啟動，每日 18:00 HKT 發送工作提示")
+    return scheduler
+
+
+# 啟動 scheduler（在 gunicorn 中也會執行）
+_scheduler = start_scheduler()
 
 
 if __name__ == "__main__":
