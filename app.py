@@ -1,23 +1,26 @@
 """
-Maggie / AIRTS WhatsApp 溝通系統
+Maggie WhatsApp 溝通系統 v2.6.0
 KIDS FIT
 
-對內身份：Maggie（溝通教練，與用戶 Arts Mak 溝通）
-對外身份：AIRTS（AI 代言人，代表 Arts Mak 向第三方發言）
+對話狀態機：
+  大王（85268993194）：
+    IDLE → 發訊息（含目標號碼）→ Maggie 改寫 → AWAITING_CONFIRM
+    AWAITING_CONFIRM → 確認 → 生成語音 → 直接發到目標號碼 + 副本給大王 → IDLE
+    AWAITING_CONFIRM → 確認（無目標號碼）→ AWAITING_NUMBER → 收到號碼 → 發送 → IDLE
 
-對話狀態機（簡化版）：
-  IDLE → 用戶發訊息 → Maggie 改寫 → AWAITING_CONFIRM
-  AWAITING_CONFIRM → 用戶確認 → 生成語音 → 發回給用戶 → IDLE
+  85263951689：
+    IDLE → 發訊息 → Maggie 改寫 → AWAITING_CONFIRM
+    AWAITING_CONFIRM → 確認 → 生成語音 → 發回本人 → IDLE
 
-用戶收到語音後可自行轉發到任何對象或群組。
+  非白名單：
+    發任何訊息 → 轉發給大王（不回覆對方）
 """
 
 import os
 import json
 import logging
-import tempfile
-import requests
 import re
+import requests
 from flask import Flask, request, jsonify
 from google import genai
 from google.genai import types
@@ -54,21 +57,22 @@ MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# 完整功能白名單：兩個號碼都有改寫+語音生成功能
+# 完整功能白名單
 WHITELIST = {"85268993194", "85263951689"}
 
-# 自動轉發設定：只有大王（85268993194）發的語音才自動轉發到此號碼
-AUTO_FORWARD_FROM = "85268993194"   # 只有這個號碼發出的語音才觸發轉發
-AUTO_FORWARD_NUMBER = "85263951689"  # 轉發目標號碼
+# 大王號碼（接收第三方轉發通知）
+DAWANG_NUMBER = "85268993194"
 
 # ─── 狀態管理（in-memory）────────────────────────────────────────────────────
 
 STATE_IDLE = "idle"
 STATE_AWAITING_CONFIRM = "awaiting_confirm"
+STATE_AWAITING_NUMBER = "awaiting_number"
 
 # user_state[from_number] = {
-#   "state": STATE_IDLE | STATE_AWAITING_CONFIRM,
-#   "rewritten_text": str,  # 改寫後的語音稿（待 TTS）
+#   "state": STATE_IDLE | STATE_AWAITING_CONFIRM | STATE_AWAITING_NUMBER,
+#   "rewritten_text": str,   # 改寫後的語音稿（待 TTS）
+#   "target_number": str,    # 目標發送號碼（可能為空）
 # }
 user_state: dict[str, dict] = {}
 
@@ -86,10 +90,10 @@ MAGGIE_SYSTEM_PROMPT = """你係 Maggie，KIDS FIT 嘅行政人員，亦係大�
 - 你同大王用純正香港粵語傾偈，簡單直接，唔做作
 
 你嘅任務：
-將大王想表達嘅內容，改寫為友善自然嘅廣東話語音稿，準備俾大王發送給幼稚園嘅女性教育工作者。
+將大王想表達嘅內容，改寫為友善自然嘅廣東話語音稿，Maggie 會直接用 WhatsApp Business 號碼發送語音給對方。
 
 最重要嘅原則（必須嚴格遵守）：
-- 語音稿必須用第一人稱「我」說話，因為係大王本人轉發的
+- 語音稿必須用第一人稱「我」說話，因為係代表大王本人發言
 - 絕對唔可以出現「Arts」「Arts Mak」「大王」呢類第三人稱
 - 直接以「我」嘅身份開口說話
 - 但係同大王對話時，要稱呼佢做「大王」
@@ -117,9 +121,9 @@ MAGGIE_SYSTEM_PROMPT = """你係 Maggie，KIDS FIT 嘅行政人員，亦係大�
 - 第二部分：給大王的確認訊息（用「大王」稱呼，香港粵語，簡單直接）
 - 範例格式：
 
-校長你好，我係 Arts，KIDS FIT 嘅負責人。我哋最近有個新嘅體能課程方案，想睇下貴校有冇興趣了解一下。方便嘅話我哋可以約個時間傾下。
+校長你好，我係 KIDS FIT 嘅 Arts。我哋最近有個新嘅體能課程方案，想睇下貴校有冇興趣了解一下。方便嘅話我哋可以約個時間傾下。
 ---
-大王，以上係改寫後嘅語音稿。OK嘅話回覆「OK」或「好」，我即刻幫你生成語音。唔啱可以回覆「取消」。
+大王，以上係改寫後嘅語音稿。OK嘅話回覆「OK」或「好」，我即刻幫你生成語音直接發出去。唔啱可以回覆「取消」。
 
 重要：
 - 語音稿部分要適合廣東話朗讀，自然流暢
@@ -189,17 +193,25 @@ def send_whatsapp_audio(to: str, media_id: str) -> dict:
         "audio": {"id": media_id}
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    logger.info(f"[WA AUDIO] to={to} status={resp.status_code}")
+    logger.info(f"[WA AUDIO] to={to} status={resp.status_code} resp={resp.text[:200]}")
     return resp.json()
+
+
+def format_phone_display(number: str) -> str:
+    """格式化電話號碼顯示，例如 85268993194 → +852 6899 3194"""
+    n = number.lstrip("+")
+    if n.startswith("852") and len(n) == 11:
+        local = n[3:]
+        return f"+852 {local[:4]} {local[4:]}"
+    return f"+{n}"
 
 
 # ─── STT（Gemini 多模態語音識別）──────────────────────────────────────────────
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
-    """使用 Gemini 多模態 API 將語音轉為文字（取代 OpenAI Whisper，避免速率限制）"""
+    """使用 Gemini 多模態 API 將語音轉為文字"""
     import base64
 
-    # 根據副檔名決定 MIME type
     mime_map = {
         ".ogg": "audio/ogg",
         ".mp3": "audio/mpeg",
@@ -209,7 +221,6 @@ def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
         ".webm": "audio/webm",
     }
     mime_type = mime_map.get(suffix.lower(), "audio/ogg")
-
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
     payload = {
@@ -226,9 +237,7 @@ def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
                 }
             ]
         }],
-        "generationConfig": {
-            "temperature": 0
-        }
+        "generationConfig": {"temperature": 0}
     }
 
     resp = requests.post(
@@ -299,16 +308,16 @@ def text_to_speech(text: str) -> bytes:
         "text": text,
         "voice_setting": {
             "voice_id": MINIMAX_VOICE_ID,
-            "speed": 0.9,      # 略慢語速，廣東話更清晰自然
-            "vol": 1.0,        # 標準音量
-            "pitch": 0         # 原音色音調
+            "speed": 0.9,
+            "vol": 1.0,
+            "pitch": 0
         },
         "audio_setting": {
             "format": "mp3",
-            "sample_rate": 32000,   # 高採樣率，音質更清晰
-            "bitrate": 128000       # 128kbps，WhatsApp 語音訊息標準
+            "sample_rate": 32000,
+            "bitrate": 128000
         },
-        "language_boost": "Chinese,Yue"  # 強制粵語（廣東話）發音
+        "language_boost": "Chinese,Yue"
     }
     resp = requests.post(MINIMAX_ENDPOINT, headers=headers, json=payload, timeout=90)
     resp.raise_for_status()
@@ -326,25 +335,24 @@ def text_to_speech(text: str) -> bytes:
 # ─── 工具函數 ─────────────────────────────────────────────────────────────────
 
 def get_user_state(user_id: str) -> dict:
-    """取得用戶當前狀態"""
     if user_id not in user_state:
         user_state[user_id] = {
             "state": STATE_IDLE,
             "rewritten_text": "",
+            "target_number": "",
         }
     return user_state[user_id]
 
 
 def reset_user_state(user_id: str):
-    """重置用戶狀態為 IDLE"""
     user_state[user_id] = {
         "state": STATE_IDLE,
         "rewritten_text": "",
+        "target_number": "",
     }
 
 
 def is_confirmation(text: str) -> bool:
-    """判斷用戶是否確認發送"""
     text_lower = text.lower().strip()
     exact_confirmations = {
         "ok", "send", "得", "發", "確認", "yes", "係",
@@ -359,7 +367,6 @@ def is_confirmation(text: str) -> bool:
 
 
 def is_cancel(text: str) -> bool:
-    """判斷用戶是否取消"""
     text_lower = text.lower().strip()
     cancels = {"唔好", "取消", "cancel", "算", "唔使", "唔洗", "no", "唔要", "重嚟", "重來"}
     if text_lower in cancels:
@@ -368,24 +375,53 @@ def is_cancel(text: str) -> bool:
     return any(p in text_lower for p in cancel_phrases)
 
 
+def extract_phone_number(text: str) -> str:
+    """
+    從文字中提取香港電話號碼。
+    支援格式：85212345678、+85212345678、12345678（8位本地號碼）
+    返回標準格式（帶852前綴），找不到則返回空字串。
+    """
+    # 先嘗試匹配帶852前綴的11位號碼
+    m = re.search(r'(?:\+?852)([235689]\d{7})', text)
+    if m:
+        return "852" + m.group(1)
+
+    # 再嘗試匹配純8位香港號碼（2/3/5/6/9開頭），允許前面係中文字或空格
+    m = re.search(r'(?:^|[\s\u4e00-\u9fff：:])([235689]\d{7})(?:[\s\u4e00-\u9fff：:,，。]|$)', text)
+    if m:
+        return "852" + m.group(1)
+
+    return ""
+
+
+def is_phone_number_only(text: str) -> str:
+    """
+    判斷訊息是否純粹是一個電話號碼（用於 AWAITING_NUMBER 狀態）。
+    返回標準格式號碼或空字串。
+    """
+    clean = text.strip().replace(" ", "").replace("-", "").replace("+", "")
+    # 11位帶852前綴
+    if re.fullmatch(r'852[235689]\d{7}', clean):
+        return clean
+    # 8位本地號碼
+    if re.fullmatch(r'[235689]\d{7}', clean):
+        return "852" + clean
+    return ""
+
+
 def parse_gemini_response(response: str) -> tuple:
     """
     解析 Gemini 回覆，分離語音稿和確認訊息
     返回 (voice_script, full_reply_to_user)
     """
-    # 嘗試用 --- 分隔符分割
     if "---" in response:
         parts = response.split("---", 1)
         voice_script = parts[0].strip()
-        confirm_msg = parts[1].strip() if len(parts) > 1 else ""
         if voice_script and len(voice_script) > 10:
             return voice_script, response
 
     # 備用：嘗試提取引號內容
-    quote_patterns = [
-        r'「([\s\S]+?)」',
-        r'"([\s\S]+?)"',
-    ]
+    quote_patterns = [r'「([\s\S]+?)」', r'"([\s\S]+?)"']
     for pattern in quote_patterns:
         matches = re.findall(pattern, response)
         if matches:
@@ -393,7 +429,7 @@ def parse_gemini_response(response: str) -> tuple:
             if len(longest) > 15:
                 return longest.strip(), response
 
-    # 最後手段：取第一段作為語音稿
+    # 最後手段：取第一段
     paragraphs = [p.strip() for p in response.split('\n\n') if p.strip()]
     for para in paragraphs:
         if len(para) > 15 and not any(kw in para for kw in ["確認", "請問", "是否", "OK", "Send", "回覆"]):
@@ -402,32 +438,62 @@ def parse_gemini_response(response: str) -> tuple:
     return response.strip(), response
 
 
-def _handle_chat_only(from_number: str, msg_type: str, msg_content: dict):
-    """普通對話白名單處理：回覆簡單訊息，保持 24 小時對話窗口"""
+# ─── 第三方訊息轉發 ───────────────────────────────────────────────────────────
+
+def forward_third_party_message(from_number: str, msg_type: str, msg_content: dict):
+    """將非白名單用戶的訊息轉發給大王，不回覆對方"""
+    display = format_phone_display(from_number)
+
     if msg_type == "text":
-        text = msg_content.get("body", "").strip().lower()
-        if any(kw in text for kw in ["ok", "好", "收到", "明白", "謝", "多謝", "唔啊", "了", "thanks", "thank"]):
-            send_whatsapp_text(from_number, "好的，收到。")
-        else:
-            send_whatsapp_text(from_number, "收到。")
+        body = msg_content.get("body", "").strip()
+        notify = f"[{display} 回覆]：{body}"
+        send_whatsapp_text(DAWANG_NUMBER, notify)
+        logger.info(f"[FORWARD TEXT] from={from_number} to={DAWANG_NUMBER}")
+
     elif msg_type == "audio":
-        send_whatsapp_text(from_number, "收到語音。")
+        audio_id = msg_content.get("id")
+        if audio_id:
+            try:
+                audio_bytes = download_whatsapp_media(audio_id)
+                transcribed = transcribe_audio(audio_bytes)
+                notify = f"[{display} 語音回覆]：{transcribed}"
+            except Exception as e:
+                logger.error(f"[FORWARD AUDIO STT ERROR] {e}")
+                notify = f"[{display} 語音回覆]：（語音識別失敗，請查看原始語音）"
+            send_whatsapp_text(DAWANG_NUMBER, notify)
+        else:
+            send_whatsapp_text(DAWANG_NUMBER, f"[{display} 語音回覆]：（無法下載語音）")
+        logger.info(f"[FORWARD AUDIO] from={from_number} to={DAWANG_NUMBER}")
+
+    elif msg_type == "image":
+        send_whatsapp_text(DAWANG_NUMBER, f"[{display} 發送了一張圖片]")
+        logger.info(f"[FORWARD IMAGE] from={from_number}")
+
+    elif msg_type == "document":
+        send_whatsapp_text(DAWANG_NUMBER, f"[{display} 發送了一個檔案]")
+        logger.info(f"[FORWARD DOC] from={from_number}")
+
+    elif msg_type == "video":
+        send_whatsapp_text(DAWANG_NUMBER, f"[{display} 發送了一段影片]")
+        logger.info(f"[FORWARD VIDEO] from={from_number}")
+
     else:
-        send_whatsapp_text(from_number, "收到。")
-    logger.info(f"[CHAT_ONLY] 回覆完成: {from_number}")
+        send_whatsapp_text(DAWANG_NUMBER, f"[{display} 發送了一條訊息（類型：{msg_type}）]")
+        logger.info(f"[FORWARD OTHER] from={from_number} type={msg_type}")
 
 
 # ─── 主要訊息處理邏輯（狀態機）────────────────────────────────────────────────
 
 def process_message(from_number: str, msg_type: str, msg_content: dict):
-    """處理接收到的 WhatsApp 訊息 - 基於狀態機"""
+    """處理接收到的 WhatsApp 訊息"""
 
-    # 白名單檢查
+    # 非白名單：轉發給大王，不回覆對方
     if from_number not in WHITELIST:
-        logger.warning(f"[WHITELIST] 拒絕: {from_number}")
-        send_whatsapp_text(from_number, "此服務僅限授權用戶使用。")
+        logger.info(f"[THIRD PARTY] 轉發訊息: from={from_number} type={msg_type}")
+        forward_third_party_message(from_number, msg_type, msg_content)
         return
 
+    # 白名單用戶：走完整 Maggie 流程
     # 取得用戶文字內容
     text = ""
     if msg_type == "text":
@@ -456,26 +522,48 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
     if not text:
         return
 
-    # 取得當前狀態
     state = get_user_state(from_number)
     current_state = state["state"]
-    logger.info(f"[STATE] user={from_number} state={current_state} input={text[:50]}")
+    logger.info(f"[STATE] user={from_number} state={current_state} input={text[:60]}")
 
     try:
         # ═══════════════════════════════════════════════════════════════════
-        # 狀態：等待用戶確認改寫內容
+        # 狀態：等待目標電話號碼
         # ═══════════════════════════════════════════════════════════════════
-        if current_state == STATE_AWAITING_CONFIRM:
-            # 檢查是否取消
+        if current_state == STATE_AWAITING_NUMBER:
             if is_cancel(text):
                 reset_user_state(from_number)
                 send_whatsapp_text(from_number, "已取消。有新訊息隨時再發給我。")
                 return
 
-            # 檢查是否確認
+            phone = is_phone_number_only(text)
+            if phone:
+                state["target_number"] = phone
+                state["state"] = STATE_AWAITING_CONFIRM
+                # 已有語音稿，直接執行發送
+                _execute_generate_and_send(from_number)
+            else:
+                send_whatsapp_text(from_number, "大王，請輸入有效嘅香港電話號碼（例如：63951689 或 85263951689）。")
+            return
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 狀態：等待用戶確認改寫內容
+        # ═══════════════════════════════════════════════════════════════════
+        if current_state == STATE_AWAITING_CONFIRM:
+            if is_cancel(text):
+                reset_user_state(from_number)
+                send_whatsapp_text(from_number, "已取消。有新訊息隨時再發給我。")
+                return
+
             if is_confirmation(text):
-                # 用戶確認了，生成語音並發回給用戶
-                _execute_generate_and_send_back(from_number)
+                target = state.get("target_number", "")
+                if not target and from_number == DAWANG_NUMBER:
+                    # 大王確認但沒有目標號碼，問號碼
+                    state["state"] = STATE_AWAITING_NUMBER
+                    send_whatsapp_text(from_number, "大王，想發到邊個號碼？")
+                    return
+                # 有目標號碼或非大王（發回本人）
+                _execute_generate_and_send(from_number)
                 return
 
             # 不是確認也不是取消，當作新的改寫請求
@@ -496,7 +584,7 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
 
 
 def _handle_new_message(from_number: str, text: str):
-    """處理新的改寫請求"""
+    """處理新的改寫請求，同時嘗試提取目標號碼"""
 
     if not text.strip():
         send_whatsapp_text(
@@ -505,8 +593,25 @@ def _handle_new_message(from_number: str, text: str):
         )
         return
 
+    # 嘗試從訊息中提取目標號碼（大王專用）
+    target_number = ""
+    message_content = text
+    if from_number == DAWANG_NUMBER:
+        target_number = extract_phone_number(text)
+        if target_number:
+            # 移除號碼部分，保留訊息內容
+            # 移除常見前綴如「同63951689講：」「幫我同85263951689講...」
+            cleaned = re.sub(
+                r'(?:幫我)?(?:同|發俾|發給|發到|告訴|通知)\s*(?:\+?852)?\s*\d{8,11}\s*(?:講|說|話|：|:)?\s*',
+                '', text, flags=re.IGNORECASE
+            ).strip()
+            # 如果清理後有內容就用，否則用原文
+            if cleaned and len(cleaned) > 3:
+                message_content = cleaned
+            logger.info(f"[EXTRACT] 目標號碼={target_number} 內容={message_content[:50]}")
+
     # 呼叫 Gemini 改寫
-    prompt = f"大王想表達：「{text}」\n\n請用第一人稱「我」改寫為友善自然嘅廣東話語音稿。記住：語音稿係大王本人講嘅，唔可以出現第三人稱。"
+    prompt = f"大王想表達：「{message_content}」\n\n請用第一人稱「我」改寫為友善自然嘅廣東話語音稿。記住：語音稿係代表大王本人講嘅，唔可以出現第三人稱。"
     gemini_reply = call_gemini(prompt, from_number)
 
     # 解析回覆
@@ -516,19 +621,21 @@ def _handle_new_message(from_number: str, text: str):
     add_to_history(from_number, "user", text)
     add_to_history(from_number, "assistant", gemini_reply)
 
-    # 設定狀態為等待確認
+    # 設定狀態
     state = get_user_state(from_number)
     state["state"] = STATE_AWAITING_CONFIRM
     state["rewritten_text"] = voice_script
+    state["target_number"] = target_number
 
-    # 回覆用戶（Gemini 的完整回覆已包含確認提示）
+    # 回覆用戶
     send_whatsapp_text(from_number, full_reply)
 
 
-def _execute_generate_and_send_back(from_number: str):
-    """生成語音並發回給用戶"""
+def _execute_generate_and_send(from_number: str):
+    """生成語音並發送"""
     state = get_user_state(from_number)
     rewritten_text = state.get("rewritten_text", "")
+    target_number = state.get("target_number", "")
 
     if not rewritten_text:
         send_whatsapp_text(from_number, "系統錯誤：缺少語音稿。請重新發送訊息。")
@@ -544,28 +651,30 @@ def _execute_generate_and_send_back(from_number: str):
         # 上傳到 WhatsApp
         media_id = upload_whatsapp_audio(audio_bytes)
 
-        # 發送語音回給用戶（大王）
-        result = send_whatsapp_audio(from_number, media_id)
-        logger.info(f"[SEND BACK to user] 結果: {result}")
+        # 決定發送邏輯
+        if from_number == DAWANG_NUMBER and target_number:
+            # 大王有指定目標號碼：直接發到對方 + 副本給大王
+            target_display = format_phone_display(target_number)
 
-        # 自動轉發：只有 AUTO_FORWARD_FROM 發出的語音才轉發
-        if from_number == AUTO_FORWARD_FROM:
-            try:
-                fwd_result = send_whatsapp_audio(AUTO_FORWARD_NUMBER, media_id)
-                logger.info(f"[AUTO FORWARD to {AUTO_FORWARD_NUMBER}] 結果: {fwd_result}")
-                fwd_ok = True
-            except Exception as fwd_e:
-                logger.error(f"[AUTO FORWARD ERROR] {fwd_e}")
-                fwd_ok = False
-            fwd_status = f"，同時已自動發送到 +852 6395 1689" if fwd_ok else "，但自動轉發失敗，請手動轉發"
+            # 發到目標號碼
+            target_result = send_whatsapp_audio(target_number, media_id)
+            target_ok = "messages" in target_result
+            logger.info(f"[SEND TO TARGET] to={target_number} ok={target_ok}")
+
+            # 副本給大王
+            send_whatsapp_audio(from_number, media_id)
+            logger.info(f"[SEND COPY TO DAWANG] to={from_number}")
+
+            if target_ok:
+                send_whatsapp_text(from_number, f"大王，語音已直接發送到 {target_display}，副本已發回俾你留底。")
+            else:
+                err_msg = target_result.get("error", {}).get("message", "未知錯誤")
+                send_whatsapp_text(from_number, f"大王，發送到 {target_display} 失敗：{err_msg[:100]}\n\n副本已發回俾你，可以手動轉發。")
+
         else:
-            fwd_status = ""
-
-        # 通知用戶
-        send_whatsapp_text(
-            from_number,
-            f"大王，語音已生成{fwd_status}。"
-        )
+            # 非大王 或 大王沒有指定目標號碼：發回本人
+            send_whatsapp_audio(from_number, media_id)
+            send_whatsapp_text(from_number, "大王，語音已生成，發回俾你留底。")
 
         # 更新對話歷史
         add_to_history(from_number, "user", "[確認生成語音]")
@@ -589,8 +698,12 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.5.2",
-        "flow": "大王發訊息 → Maggie改寫 → 大王確認 → 生成粵語語音發回大王 → 大王自行轉發"
+        "version": "2.6.0",
+        "flow": {
+            "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
+            "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
+            "第三方": "發訊息 → 自動轉發給大王（不回覆對方）"
+        }
     })
 
 
@@ -654,7 +767,7 @@ def webhook_receive():
 def test_tts():
     """測試 MiniMax TTS"""
     data = request.get_json(force=True)
-    text = data.get("text", "你好，我係 AIRTS，代表 Arts Mak 向你問好。")
+    text = data.get("text", "你好，我係 KIDS FIT 嘅 Arts。")
     try:
         audio_bytes = text_to_speech(text)
         return jsonify({"status": "ok", "audio_size_bytes": len(audio_bytes)})
@@ -667,7 +780,7 @@ def test_send_text():
     """測試發送文字訊息"""
     data = request.get_json(force=True)
     to = data.get("to", "85268993194")
-    message = data.get("message", "AIRTS 系統測試 - v2.3")
+    message = data.get("message", "Maggie 系統測試")
     try:
         result = send_whatsapp_text(to, message)
         return jsonify({"status": "ok", "result": result})
@@ -679,7 +792,7 @@ def test_send_text():
 def debug_state():
     """查看當前所有用戶狀態（除錯用）"""
     return jsonify({
-        "user_states": {k: v["state"] for k, v in user_state.items()},
+        "user_states": {k: {"state": v["state"], "target": v.get("target_number", "")} for k, v in user_state.items()},
         "history_counts": {k: len(v) for k, v in conversation_history.items()}
     })
 
