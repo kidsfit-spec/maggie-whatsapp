@@ -174,29 +174,55 @@ def send_whatsapp_audio(to: str, media_id: str) -> dict:
     return resp.json()
 
 
-# ─── STT（OpenAI Whisper）────────────────────────────────────────────────────
+# ─── STT（Gemini 多模態語音識別）──────────────────────────────────────────────
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
-    """使用 OpenAI Whisper API 將音頻轉為文字（直接用 requests，避免 SDK 版本衝突）"""
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
+    """使用 Gemini 多模態 API 將語音轉為文字（取代 OpenAI Whisper，避免速率限制）"""
+    import base64
 
-    try:
-        with open(tmp_path, "rb") as audio_file:
-            resp = requests.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={"file": (f"audio{suffix}", audio_file, "audio/ogg")},
-                data={"model": "whisper-1", "language": "zh"},
-                timeout=60
-            )
-        resp.raise_for_status()
-        text = resp.json().get("text", "").strip()
-        logger.info(f"[STT] 識別結果: {text[:100]}")
-        return text
-    finally:
-        os.unlink(tmp_path)
+    # 根據副檔名決定 MIME type
+    mime_map = {
+        ".ogg": "audio/ogg",
+        ".mp3": "audio/mpeg",
+        ".mp4": "audio/mp4",
+        ".wav": "audio/wav",
+        ".m4a": "audio/mp4",
+        ".webm": "audio/webm",
+    }
+    mime_type = mime_map.get(suffix.lower(), "audio/ogg")
+
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": audio_b64
+                    }
+                },
+                {
+                    "text": "請將這段廣東話語音轉錄為文字，只輸出文字內容，不要加任何解釋或標點以外的內容。"
+                }
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0
+        }
+    }
+
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
+        headers={"Content-Type": "application/json"},
+        json=payload,
+        timeout=60
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    logger.info(f"[STT Gemini] 識別結果: {text[:100]}")
+    return text
 
 
 # ─── Gemini AI 改寫 ───────────────────────────────────────────────────────────
@@ -510,7 +536,7 @@ def index():
         "service": "AIRTS WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 AIRTS",
         "status": "running",
-        "version": "2.3.0",
+        "version": "2.3.2",
         "flow": "用戶發訊息 → AIRTS改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
     })
 
