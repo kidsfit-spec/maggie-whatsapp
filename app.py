@@ -297,7 +297,8 @@ def text_to_speech(text: str) -> bytes:
             "format": "mp3",
             "sample_rate": 32000,   # 高採樣率，音質更清晰
             "bitrate": 128000       # 128kbps，WhatsApp 語音訊息標準
-        }
+        },
+        "language_boost": "Chinese,Yue"  # 強制粵語（廣東話）發音
     }
     resp = requests.post(MINIMAX_ENDPOINT, headers=headers, json=payload, timeout=90)
     resp.raise_for_status()
@@ -550,7 +551,7 @@ def index():
         "service": "AIRTS WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 AIRTS",
         "status": "running",
-        "version": "2.3.6",
+        "version": "2.3.7",
         "flow": "用戶發訊息 → AIRTS改寫 → 用戶確認 → 生成語音發回用戶 → 用戶自行轉發"
     })
 
