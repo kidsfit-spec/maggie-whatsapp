@@ -696,6 +696,54 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
         send_whatsapp_text(from_number, "系統發生錯誤，請稍後再試。")
 
 
+def _handle_direct_text(from_number: str, text: str) -> bool:
+    """
+    檢查是否為「文字直接回覆」指令。
+    格式：「文字回覆 / 文字 / text」+ 號碼 + 內容
+    如果符合，直接發送文字，返回 True；否則返回 False。
+    """
+    # 匹配觸發關鍵詞
+    m = re.match(
+        r'^(?:文字回覆|文字|text)\s+(?:\+?852)?([235689]\d{7})\s+(.+)$',
+        text.strip(), re.IGNORECASE | re.DOTALL
+    )
+    if not m:
+        return False
+
+    raw_number = m.group(1).strip()
+    content = m.group(2).strip()
+
+    # 補上 852 前綴
+    if len(raw_number) == 8:
+        target = "852" + raw_number
+    else:
+        target = raw_number
+
+    target_display = format_phone_display(target)
+    logger.info(f"[DIRECT TEXT] from={from_number} to={target} content={content[:50]}")
+
+    result = send_whatsapp_text(target, content)
+    if "messages" in result:
+        send_whatsapp_text(from_number, f"已發送文字到 {target_display}。")
+        logger.info(f"[DIRECT TEXT] 發送成功 to={target}")
+    else:
+        err_code = result.get("error", {}).get("code", 0)
+        err_msg = result.get("error", {}).get("message", "未知錯誤")
+        is_window_error = err_code in (131047, 131026, 131028) or \
+            any(kw in err_msg.lower() for kw in ["24", "window", "session", "outside"])
+        if is_window_error:
+            send_whatsapp_text(
+                from_number,
+                f"大王，文字發送到 {target_display} 失敗。"
+                f"對方未開啟對話窗口，請叫對方先發一條訊息到 95789829。"
+            )
+        else:
+            send_whatsapp_text(from_number, f"大王，文字發送到 {target_display} 失敗：{err_msg[:80]}")
+        logger.error(f"[DIRECT TEXT] 發送失敗 to={target} code={err_code}: {err_msg}")
+
+    return True
+
+
 def _handle_new_message(from_number: str, text: str):
     """處理新的改寫請求，同時嘗試提取目標號碼"""
 
@@ -704,6 +752,10 @@ def _handle_new_message(from_number: str, text: str):
             from_number,
             "大王，你想表達咩？話俾我知，我幫你改寫為友善自然嘅版本。"
         )
+        return
+
+    # 大王專用：文字直接回覆指令（不經改寫）
+    if from_number == DAWANG_NUMBER and _handle_direct_text(from_number, text):
         return
 
     # 嘗試從訊息中提取目標號碼（大王專用）
@@ -836,7 +888,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.8.0",
+        "version": "2.8.1",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
