@@ -1,5 +1,5 @@
 """
-Maggie WhatsApp 溝通系統 v2.6.0
+Maggie WhatsApp 溝通系統 v2.7.0
 KIDS FIT
 
 對話狀態機：
@@ -14,12 +14,18 @@ KIDS FIT
 
   非白名單：
     發任何訊息 → 轉發給大王（不回覆對方）
+
+v2.7.0 修正：
+  - 使用文件持久化狀態（/tmp/maggie_states.json），防止進程重啟丟失
+  - AWAITING_NUMBER 狀態下支持多號碼（「93365596 同 95068886」）
+  - 加入 threading.Lock 確保狀態讀寫線程安全
 """
 
 import os
 import json
 import logging
 import re
+import threading
 import requests
 from flask import Flask, request, jsonify
 from google import genai
@@ -63,21 +69,98 @@ WHITELIST = {"85268993194", "85263951689"}
 # 大王號碼（接收第三方轉發通知）
 DAWANG_NUMBER = "85268993194"
 
-# ─── 狀態管理（in-memory）────────────────────────────────────────────────────
+# ─── 狀態管理（文件持久化 + 線程安全）──────────────────────────────────────────
 
 STATE_IDLE = "idle"
 STATE_AWAITING_CONFIRM = "awaiting_confirm"
 STATE_AWAITING_NUMBER = "awaiting_number"
 
-# user_state[from_number] = {
-#   "state": STATE_IDLE | STATE_AWAITING_CONFIRM | STATE_AWAITING_NUMBER,
-#   "rewritten_text": str,   # 改寫後的語音稿（待 TTS）
-#   "target_number": str,    # 目標發送號碼（可能為空）
-# }
-user_state: dict[str, dict] = {}
+STATE_FILE = "/tmp/maggie_states.json"
+HISTORY_FILE = "/tmp/maggie_history.json"
+_state_lock = threading.Lock()
 
-# 對話歷史，每個用戶保留最近8條
-conversation_history: dict[str, list] = {}
+def _load_states() -> dict:
+    """從文件載入所有用戶狀態"""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"[STATE LOAD ERROR] {e}")
+    return {}
+
+def _save_states(states: dict):
+    """將所有用戶狀態保存到文件"""
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(states, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"[STATE SAVE ERROR] {e}")
+
+def _load_history() -> dict:
+    """從文件載入對話歷史"""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"[HISTORY LOAD ERROR] {e}")
+    return {}
+
+def _save_history(history: dict):
+    """將對話歷史保存到文件"""
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"[HISTORY SAVE ERROR] {e}")
+
+def get_user_state(user_id: str) -> dict:
+    """獲取用戶狀態（線程安全）"""
+    with _state_lock:
+        states = _load_states()
+        if user_id not in states:
+            states[user_id] = {
+                "state": STATE_IDLE,
+                "rewritten_text": "",
+                "target_numbers": [],
+            }
+            _save_states(states)
+        return states[user_id]
+
+def set_user_state(user_id: str, state_data: dict):
+    """設定用戶狀態並持久化（線程安全）"""
+    with _state_lock:
+        states = _load_states()
+        states[user_id] = state_data
+        _save_states(states)
+    logger.info(f"[STATE SET] user={user_id} state={state_data.get('state')} targets={state_data.get('target_numbers', [])}")
+
+def reset_user_state(user_id: str):
+    """重置用戶狀態（線程安全）"""
+    with _state_lock:
+        states = _load_states()
+        states[user_id] = {
+            "state": STATE_IDLE,
+            "rewritten_text": "",
+            "target_numbers": [],
+        }
+        _save_states(states)
+    logger.info(f"[STATE RESET] user={user_id}")
+
+def get_history(user_id: str) -> list:
+    history = _load_history()
+    return history.get(user_id, [])
+
+def add_to_history(user_id: str, role: str, content: str):
+    history = _load_history()
+    if user_id not in history:
+        history[user_id] = []
+    history[user_id].append({"role": role, "content": content})
+    if len(history[user_id]) > 8:
+        history[user_id] = history[user_id][-8:]
+    _save_history(history)
+
 
 # ─── AI 系統提示 ──────────────────────────────────────────────────────────────
 
@@ -255,18 +338,6 @@ def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
 
 # ─── Gemini AI 改寫 ───────────────────────────────────────────────────────────
 
-def get_history(user_id: str) -> list:
-    return conversation_history.get(user_id, [])
-
-
-def add_to_history(user_id: str, role: str, content: str):
-    if user_id not in conversation_history:
-        conversation_history[user_id] = []
-    conversation_history[user_id].append({"role": role, "content": content})
-    if len(conversation_history[user_id]) > 8:
-        conversation_history[user_id] = conversation_history[user_id][-8:]
-
-
 def call_gemini(user_message: str, user_id: str) -> str:
     """呼叫 Gemini 生成改寫回覆"""
     client = genai.Client(api_key=GEMINI_API_KEY)
@@ -334,39 +405,24 @@ def text_to_speech(text: str) -> bytes:
 
 # ─── 工具函數 ─────────────────────────────────────────────────────────────────
 
-def get_user_state(user_id: str) -> dict:
-    if user_id not in user_state:
-        user_state[user_id] = {
-            "state": STATE_IDLE,
-            "rewritten_text": "",
-            "target_number": "",
-        }
-    return user_state[user_id]
-
-
-def reset_user_state(user_id: str):
-    user_state[user_id] = {
-        "state": STATE_IDLE,
-        "rewritten_text": "",
-        "target_number": "",
-    }
-
-
 def is_confirmation(text: str) -> bool:
+    """判斷是否為確認詞"""
     text_lower = text.lower().strip()
     exact_confirmations = {
         "ok", "send", "得", "發", "確認", "yes", "係",
         "好", "發送", "ok la", "得la", "得喇", "ok喇",
         "send喇", "傳送", "go", "go ahead", "傳",
-        "可以", "okay", "收到", "好的"
+        "可以", "okay", "收到", "好的", "好啊", "好呀",
+        "ok啦", "得啦", "好啦", "可以啦"
     }
     if text_lower in exact_confirmations:
         return True
-    long_confirmations = ["ok喇", "send喇", "得喇", "ok la", "go ahead", "確認發送", "可以發"]
+    long_confirmations = ["ok喇", "send喇", "得喇", "ok la", "go ahead", "確認發送", "可以發", "ok啦", "得啦"]
     return any(conf in text_lower for conf in long_confirmations)
 
 
 def is_cancel(text: str) -> bool:
+    """判斷是否為取消詞"""
     text_lower = text.lower().strip()
     cancels = {"唔好", "取消", "cancel", "算", "唔使", "唔洗", "no", "唔要", "重嚟", "重來"}
     if text_lower in cancels:
@@ -377,7 +433,7 @@ def is_cancel(text: str) -> bool:
 
 def extract_phone_number(text: str) -> str:
     """
-    從文字中提取香港電話號碼。
+    從文字中提取單個香港電話號碼。
     支援格式：85212345678、+85212345678、12345678（8位本地號碼）
     返回標準格式（帶852前綴），找不到則返回空字串。
     """
@@ -386,27 +442,55 @@ def extract_phone_number(text: str) -> str:
     if m:
         return "852" + m.group(1)
 
-    # 再嘗試匹配純8位香港號碼（2/3/5/6/9開頭），允許前面係中文字或空格
-    m = re.search(r'(?:^|[\s\u4e00-\u9fff：:])([235689]\d{7})(?:[\s\u4e00-\u9fff：:,，。]|$)', text)
+    # 再嘗試匹配純8位香港號碼（2/3/5/6/9開頭）
+    m = re.search(r'(?:^|[\s\u4e00-\u9fff：:，,])([235689]\d{7})(?:[\s\u4e00-\u9fff：:,，。]|$)', text)
     if m:
         return "852" + m.group(1)
 
     return ""
 
 
-def is_phone_number_only(text: str) -> str:
+def extract_multiple_phone_numbers(text: str) -> list:
     """
-    判斷訊息是否純粹是一個電話號碼（用於 AWAITING_NUMBER 狀態）。
-    返回標準格式號碼或空字串。
+    從文字中提取多個香港電話號碼。
+    支援格式：「93365596 同 95068886」「93365596, 95068886」「93365596、95068886」
+    返回標準格式列表（帶852前綴）。
     """
-    clean = text.strip().replace(" ", "").replace("-", "").replace("+", "")
-    # 11位帶852前綴
-    if re.fullmatch(r'852[235689]\d{7}', clean):
-        return clean
-    # 8位本地號碼
-    if re.fullmatch(r'[235689]\d{7}', clean):
-        return "852" + clean
-    return ""
+    numbers = []
+
+    # 匹配帶852前綴的號碼
+    for m in re.finditer(r'(?:\+?852)([235689]\d{7})', text):
+        num = "852" + m.group(1)
+        if num not in numbers:
+            numbers.append(num)
+
+    # 匹配純8位號碼（2/3/5/6/9開頭）- 用 lookahead/lookbehind 避免消耗分隔符
+    for m in re.finditer(r'(?:^|(?<=\D))([235689]\d{7})(?=\D|$)', text):
+        num = "852" + m.group(1)
+        if num not in numbers:
+            numbers.append(num)
+
+    # 如果上面沒找到，嘗試更寬鬆的匹配（純數字序列）
+    if not numbers:
+        # 清理文字，找所有8位或11位數字序列
+        clean = re.sub(r'[同和,，、\s\+]', ' ', text)
+        for part in clean.split():
+            part = part.strip()
+            if re.fullmatch(r'852[235689]\d{7}', part):
+                num = part
+                if num not in numbers:
+                    numbers.append(num)
+            elif re.fullmatch(r'[235689]\d{7}', part):
+                num = "852" + part
+                if num not in numbers:
+                    numbers.append(num)
+
+    return numbers
+
+
+def contains_phone_numbers(text: str) -> bool:
+    """判斷文字中是否包含電話號碼"""
+    return len(extract_multiple_phone_numbers(text)) > 0
 
 
 def parse_gemini_response(response: str) -> tuple:
@@ -522,57 +606,68 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
     if not text:
         return
 
+    # *** 關鍵：先讀取狀態，然後根據狀態決定處理方式 ***
     state = get_user_state(from_number)
     current_state = state["state"]
-    logger.info(f"[STATE] user={from_number} state={current_state} input={text[:60]}")
+    logger.info(f"[STATE CHECK] user={from_number} state={current_state} input='{text[:80]}'")
 
     try:
         # ═══════════════════════════════════════════════════════════════════
-        # 狀態：等待目標電話號碼
+        # 狀態：等待目標電話號碼（AWAITING_NUMBER）
         # ═══════════════════════════════════════════════════════════════════
         if current_state == STATE_AWAITING_NUMBER:
+            logger.info(f"[AWAITING_NUMBER] 收到: '{text}'")
+
             if is_cancel(text):
                 reset_user_state(from_number)
                 send_whatsapp_text(from_number, "已取消。有新訊息隨時再發給我。")
                 return
 
-            phone = is_phone_number_only(text)
-            if phone:
-                state["target_number"] = phone
-                state["state"] = STATE_AWAITING_CONFIRM
-                # 已有語音稿，直接執行發送
+            # 嘗試提取多個號碼
+            phones = extract_multiple_phone_numbers(text)
+            if phones:
+                logger.info(f"[AWAITING_NUMBER] 提取到號碼: {phones}")
+                state["target_numbers"] = phones
+                set_user_state(from_number, state)
+                # 有號碼，直接執行發送
                 _execute_generate_and_send(from_number)
-            else:
-                send_whatsapp_text(from_number, "大王，請輸入有效嘅香港電話號碼（例如：63951689 或 85263951689）。")
+                return
+
+            # 沒有找到號碼
+            send_whatsapp_text(from_number, "大王，請輸入有效嘅香港電話號碼（例如：63951689 或 85263951689）。\n\n多個號碼可以用「同」或「,」分隔，例如：93365596 同 95068886")
             return
 
         # ═══════════════════════════════════════════════════════════════════
-        # 狀態：等待用戶確認改寫內容
+        # 狀態：等待用戶確認改寫內容（AWAITING_CONFIRM）
         # ═══════════════════════════════════════════════════════════════════
         if current_state == STATE_AWAITING_CONFIRM:
+            logger.info(f"[AWAITING_CONFIRM] 收到: '{text}' | is_confirm={is_confirmation(text)} | is_cancel={is_cancel(text)}")
+
             if is_cancel(text):
                 reset_user_state(from_number)
                 send_whatsapp_text(from_number, "已取消。有新訊息隨時再發給我。")
                 return
 
             if is_confirmation(text):
-                target = state.get("target_number", "")
-                if not target and from_number == DAWANG_NUMBER:
+                targets = state.get("target_numbers", [])
+                if not targets and from_number == DAWANG_NUMBER:
                     # 大王確認但沒有目標號碼，問號碼
                     state["state"] = STATE_AWAITING_NUMBER
-                    send_whatsapp_text(from_number, "大王，想發到邊個號碼？")
+                    set_user_state(from_number, state)
+                    send_whatsapp_text(from_number, "大王，想發到邊個號碼？\n（多個號碼可以用「同」或「,」分隔）")
                     return
                 # 有目標號碼或非大王（發回本人）
                 _execute_generate_and_send(from_number)
                 return
 
-            # 不是確認也不是取消，當作新的改寫請求
+            # 不是確認也不是取消 → 當作新的改寫請求
+            logger.info(f"[AWAITING_CONFIRM] 非確認非取消，當作新訊息處理")
             reset_user_state(from_number)
             _handle_new_message(from_number, text)
             return
 
         # ═══════════════════════════════════════════════════════════════════
-        # 狀態：空閒（接收新訊息）
+        # 狀態：空閒（IDLE，接收新訊息）
         # ═══════════════════════════════════════════════════════════════════
         else:  # STATE_IDLE
             _handle_new_message(from_number, text)
@@ -594,21 +689,24 @@ def _handle_new_message(from_number: str, text: str):
         return
 
     # 嘗試從訊息中提取目標號碼（大王專用）
-    target_number = ""
+    target_numbers = []
     message_content = text
     if from_number == DAWANG_NUMBER:
-        target_number = extract_phone_number(text)
-        if target_number:
+        target_numbers = extract_multiple_phone_numbers(text)
+        if target_numbers:
             # 移除號碼部分，保留訊息內容
-            # 移除常見前綴如「同63951689講：」「幫我同85263951689講...」
             cleaned = re.sub(
                 r'(?:幫我)?(?:同|發俾|發給|發到|告訴|通知)\s*(?:\+?852)?\s*\d{8,11}\s*(?:講|說|話|：|:)?\s*',
                 '', text, flags=re.IGNORECASE
             ).strip()
+            # 移除所有號碼本身
+            cleaned = re.sub(r'(?:\+?852)?[235689]\d{7}', '', cleaned).strip()
+            # 移除連接詞
+            cleaned = re.sub(r'^[\s同和,，、]+|[\s同和,，、]+$', '', cleaned).strip()
             # 如果清理後有內容就用，否則用原文
-            if cleaned and len(cleaned) > 3:
+            if cleaned and len(cleaned) > 2:
                 message_content = cleaned
-            logger.info(f"[EXTRACT] 目標號碼={target_number} 內容={message_content[:50]}")
+            logger.info(f"[EXTRACT] 目標號碼={target_numbers} 內容={message_content[:50]}")
 
     # 呼叫 Gemini 改寫
     prompt = f"大王想表達：「{message_content}」\n\n請用第一人稱「我」改寫為友善自然嘅廣東話語音稿。記住：語音稿係代表大王本人講嘅，唔可以出現第三人稱。"
@@ -621,11 +719,13 @@ def _handle_new_message(from_number: str, text: str):
     add_to_history(from_number, "user", text)
     add_to_history(from_number, "assistant", gemini_reply)
 
-    # 設定狀態
-    state = get_user_state(from_number)
-    state["state"] = STATE_AWAITING_CONFIRM
-    state["rewritten_text"] = voice_script
-    state["target_number"] = target_number
+    # 設定狀態並持久化
+    new_state = {
+        "state": STATE_AWAITING_CONFIRM,
+        "rewritten_text": voice_script,
+        "target_numbers": target_numbers,
+    }
+    set_user_state(from_number, new_state)
 
     # 回覆用戶
     send_whatsapp_text(from_number, full_reply)
@@ -635,7 +735,7 @@ def _execute_generate_and_send(from_number: str):
     """生成語音並發送"""
     state = get_user_state(from_number)
     rewritten_text = state.get("rewritten_text", "")
-    target_number = state.get("target_number", "")
+    target_numbers = state.get("target_numbers", [])
 
     if not rewritten_text:
         send_whatsapp_text(from_number, "系統錯誤：缺少語音稿。請重新發送訊息。")
@@ -652,29 +752,39 @@ def _execute_generate_and_send(from_number: str):
         media_id = upload_whatsapp_audio(audio_bytes)
 
         # 決定發送邏輯
-        if from_number == DAWANG_NUMBER and target_number:
+        if from_number == DAWANG_NUMBER and target_numbers:
             # 大王有指定目標號碼：直接發到對方 + 副本給大王
-            target_display = format_phone_display(target_number)
+            success_targets = []
+            failed_targets = []
 
-            # 發到目標號碼
-            target_result = send_whatsapp_audio(target_number, media_id)
-            target_ok = "messages" in target_result
-            logger.info(f"[SEND TO TARGET] to={target_number} ok={target_ok}")
+            for target in target_numbers:
+                target_display = format_phone_display(target)
+                result = send_whatsapp_audio(target, media_id)
+                if "messages" in result:
+                    success_targets.append(target_display)
+                    logger.info(f"[SEND TO TARGET] to={target} OK")
+                else:
+                    err_msg = result.get("error", {}).get("message", "未知錯誤")
+                    failed_targets.append(f"{target_display}（{err_msg[:50]}）")
+                    logger.error(f"[SEND TO TARGET] to={target} FAILED: {err_msg}")
 
             # 副本給大王
             send_whatsapp_audio(from_number, media_id)
             logger.info(f"[SEND COPY TO DAWANG] to={from_number}")
 
-            if target_ok:
-                send_whatsapp_text(from_number, f"大王，語音已直接發送到 {target_display}，副本已發回俾你留底。")
-            else:
-                err_msg = target_result.get("error", {}).get("message", "未知錯誤")
-                send_whatsapp_text(from_number, f"大王，發送到 {target_display} 失敗：{err_msg[:100]}\n\n副本已發回俾你，可以手動轉發。")
+            # 通知結果
+            msg_parts = []
+            if success_targets:
+                msg_parts.append(f"大王，語音已直接發送到：{', '.join(success_targets)}")
+            if failed_targets:
+                msg_parts.append(f"發送失敗：{', '.join(failed_targets)}")
+            msg_parts.append("副本已發回俾你留底。")
+            send_whatsapp_text(from_number, "\n".join(msg_parts))
 
         else:
             # 非大王 或 大王沒有指定目標號碼：發回本人
             send_whatsapp_audio(from_number, media_id)
-            send_whatsapp_text(from_number, "大王，語音已生成，發回俾你留底。")
+            send_whatsapp_text(from_number, "語音已生成，發回俾你。")
 
         # 更新對話歷史
         add_to_history(from_number, "user", "[確認生成語音]")
@@ -698,7 +808,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.6.1",
+        "version": "2.7.0",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
@@ -791,9 +901,10 @@ def test_send_text():
 @app.route("/debug/state", methods=["GET"])
 def debug_state():
     """查看當前所有用戶狀態（除錯用）"""
+    states = _load_states()
     return jsonify({
-        "user_states": {k: {"state": v["state"], "target": v.get("target_number", "")} for k, v in user_state.items()},
-        "history_counts": {k: len(v) for k, v in conversation_history.items()}
+        "user_states": states,
+        "history_counts": {k: len(v) for k, v in _load_history().items()}
     })
 
 
