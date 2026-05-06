@@ -764,11 +764,12 @@ def _execute_generate_and_send(from_number: str):
                     success_targets.append(target_display)
                     logger.info(f"[SEND TO TARGET] to={target} OK")
                 else:
+                    err_code = result.get("error", {}).get("code", 0)
                     err_msg = result.get("error", {}).get("message", "未知錯誤")
-                    failed_targets.append(f"{target_display}（{err_msg[:50]}）")
-                    logger.error(f"[SEND TO TARGET] to={target} FAILED: {err_msg}")
+                    failed_targets.append((target_display, err_code, err_msg))
+                    logger.error(f"[SEND TO TARGET] to={target} FAILED code={err_code}: {err_msg}")
 
-            # 副本給大王
+            # 副本給大王（無論成功失敗都發）
             send_whatsapp_audio(from_number, media_id)
             logger.info(f"[SEND COPY TO DAWANG] to={from_number}")
 
@@ -776,10 +777,19 @@ def _execute_generate_and_send(from_number: str):
             msg_parts = []
             if success_targets:
                 msg_parts.append(f"大王，語音已直接發送到：{', '.join(success_targets)}")
-            if failed_targets:
-                msg_parts.append(f"發送失敗：{', '.join(failed_targets)}")
+            for (disp, code, err) in failed_targets:
+                # 判斷是否 24 小時窗口問題（error code 131047 或 131026）
+                is_window_error = code in (131047, 131026, 131028) or \
+                    any(kw in err.lower() for kw in ["24", "window", "session", "outside", "re-engagement"])
+                if is_window_error:
+                    msg_parts.append(
+                        f"大王，語音發送到 {disp} 失敗。"
+                        f"對方未開啟對話窗口，請叫對方先發一條訊息到 95789829。"
+                    )
+                else:
+                    msg_parts.append(f"大王，語音發送到 {disp} 失敗：{err[:80]}")
             msg_parts.append("副本已發回俾你留底。")
-            send_whatsapp_text(from_number, "\n".join(msg_parts))
+            send_whatsapp_text(from_number, "\n\n".join(msg_parts))
 
         else:
             # 非大王 或 大王沒有指定目標號碼：發回本人
@@ -808,7 +818,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.7.0",
+        "version": "2.7.1",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
