@@ -29,8 +29,6 @@ import threading
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-from google import genai
-from google.genai import types
 from apscheduler.schedulers.background import BackgroundScheduler
 import pytz
 
@@ -64,7 +62,8 @@ MINIMAX_MODEL = "speech-2.8-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # 保留備用
 
 # 完整功能白名單
 WHITELIST = {"85268993194", "85263951689"}
@@ -349,12 +348,10 @@ def format_phone_display(number: str) -> str:
     return f"+{n}"
 
 
-# ─── STT（Gemini 多模態語音識別）──────────────────────────────────────────────
+# ─── STT（OpenAI Whisper 語音識別）─────────────────────────────────────────────
 
 def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
-    """使用 Gemini 多模態 API 將語音轉為文字"""
-    import base64
-
+    """使用 OpenAI Whisper API 將語音轉為文字（失敗自動重試一次）"""
     mime_map = {
         ".ogg": "audio/ogg",
         ".mp3": "audio/mpeg",
@@ -364,74 +361,87 @@ def transcribe_audio(audio_bytes: bytes, suffix: str = ".ogg") -> str:
         ".webm": "audio/webm",
     }
     mime_type = mime_map.get(suffix.lower(), "audio/ogg")
-    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    filename = f"audio{suffix}"
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": audio_b64
-                    }
+    # 使用 OPENAI_API_BASE 支援自定義端點
+    whisper_url = OPENAI_API_BASE.rstrip("/") + "/audio/transcriptions"
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            logger.info(f"[STT] attempt={attempt} audio_size={len(audio_bytes)} suffix={suffix}")
+            resp = requests.post(
+                whisper_url,
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={
+                    "file": (filename, audio_bytes, mime_type),
+                    "model": (None, "whisper-1"),
+                    "language": (None, "zh"),
+                    "prompt": (None, "廣東話香港粵語")
                 },
-                {
-                    "text": "請將這段廣東話語音轉錄為文字，只輸出文字內容，不要加任何解釋或標點以外的內容。"
-                }
-            ]
-        }],
-        "generationConfig": {"temperature": 0}
-    }
+                timeout=60
+            )
+            logger.info(f"[STT] status={resp.status_code}")
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+            logger.info(f"[STT Whisper] 識別結果: {text[:100]}")
+            return text
+        except Exception as e:
+            last_error = e
+            logger.error(f"[STT] attempt={attempt} 失敗: {type(e).__name__}: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(3)
 
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}",
-        headers={"Content-Type": "application/json"},
-        json=payload,
-        timeout=60
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-    logger.info(f"[STT Gemini] 識別結果: {text[:100]}")
-    return text
+    raise last_error
 
 
-# ─── Gemini AI 改寫 ───────────────────────────────────────────────────────────
+# ─── OpenAI GPT AI 改寫 ─────────────────────────────────────────────────
 
 def call_gemini(user_message: str, user_id: str) -> str:
-    """呼叫 Gemini 生成改寫回覆"""
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    """呼叫 OpenAI GPT 生成改寫回覆（函數名保留以相容旧代碼）"""
     history = get_history(user_id)
 
-    contents = []
+    messages = [{"role": "system", "content": MAGGIE_SYSTEM_PROMPT}]
     for msg in history:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append(types.Content(
-            role=role,
-            parts=[types.Part(text=msg["content"])]
-        ))
-    contents.append(types.Content(
-        role="user",
-        parts=[types.Part(text=user_message)]
-    ))
+        role = "user" if msg["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_message})
 
-    try:
-        logger.info(f"[GEMINI] 呼叫 Gemini 模型 user={user_id} msg_len={len(user_message)}")
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            config=types.GenerateContentConfig(
-                system_instruction=MAGGIE_SYSTEM_PROMPT,
-                temperature=0.7,
-                http_options=types.HttpOptions(timeout=60000)  # 60 秒 timeout
-            ),
-            contents=contents
-        )
-        result = response.text
-        logger.info(f"[GEMINI] 回應成功 len={len(result)}")
-        return result
-    except Exception as e:
-        logger.error(f"[GEMINI ERROR] {type(e).__name__}: {e}")
-        raise RuntimeError(f"Gemini AI 調用失敗：{type(e).__name__}: {str(e)[:150]}") from e
+    chat_url = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            logger.info(f"[GPT] attempt={attempt} user={user_id} msg_len={len(user_message)}")
+            resp = requests.post(
+                chat_url,
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": messages,
+                    "temperature": 0.7,
+                    "max_tokens": 1000
+                },
+                timeout=60
+            )
+            logger.info(f"[GPT] status={resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            result = data["choices"][0]["message"]["content"].strip()
+            logger.info(f"[GPT] 回應成功 len={len(result)}")
+            return result
+        except Exception as e:
+            last_error = e
+            logger.error(f"[GPT ERROR] attempt={attempt} {type(e).__name__}: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(3)
+
+    raise RuntimeError(f"OpenAI GPT 調用失敗：{type(e).__name__}: {str(last_error)[:150]}") from last_error
 
 
 # ─── MiniMax TTS ─────────────────────────────────────────────────────────────
@@ -1050,7 +1060,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.8.4",
+        "version": "2.9.0",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
