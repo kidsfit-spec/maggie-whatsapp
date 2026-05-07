@@ -62,7 +62,8 @@ MINIMAX_MODEL = "speech-2.8-hd"
 MINIMAX_ENDPOINT = "https://api.minimax.io/v1/t2a_v2"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+# 確保空字串時也使用預設値（Render 上 OPENAI_API_BASE 可能為空字串）
+OPENAI_API_BASE = os.environ.get("OPENAI_API_BASE", "").strip() or "https://api.openai.com/v1"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")  # 保留備用
 
 # 完整功能白名單
@@ -771,9 +772,21 @@ def process_message(from_number: str, msg_type: str, msg_content: dict):
             _handle_new_message(from_number, text)
 
     except Exception as e:
-        logger.error(f"[ERROR] 處理訊息失敗: {e}", exc_info=True)
+        import traceback
+        err_type = type(e).__name__
+        err_msg = str(e)
+        tb = traceback.format_exc()
+        logger.error(f"[ERROR] 處理訊息失敗: {err_type}: {err_msg}\n{tb}")
         reset_user_state(from_number)
-        send_whatsapp_text(from_number, "系統發生錯誤，請稍後再試。")
+        # 發送具體錯誤訊息給大王，方便排查
+        detail = err_msg[:200] if err_msg else "Unknown error"
+        send_whatsapp_text(
+            from_number,
+            f"大王，系統出現錯誤：\n"
+            f"錯誤類型：{err_type}\n"
+            f"錯誤詳情：{detail}\n\n"
+            f"請將以上訊息發給技術支援。"
+        )
 
 
 def _handle_direct_text(from_number: str, text: str) -> bool:
@@ -1060,7 +1073,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.9.0",
+        "version": "2.9.1",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
