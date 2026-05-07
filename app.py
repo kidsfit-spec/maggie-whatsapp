@@ -266,22 +266,39 @@ def download_whatsapp_media(media_id: str) -> bytes:
 
 
 def upload_whatsapp_audio(audio_bytes: bytes) -> str:
-    """上傳音頻到 WhatsApp，返回 media_id"""
+    """上傳音頻到 WhatsApp，返回 media_id（失敗自動重試一次）"""
     url = f"{WA_API_BASE}/media"
     headers = {"Authorization": f"Bearer {WA_ACCESS_TOKEN}"}
-    files = {
-        "file": ("audio.mp3", audio_bytes, "audio/mpeg"),
-        "messaging_product": (None, "whatsapp"),
-        "type": (None, "audio/mpeg")
-    }
-    resp = requests.post(url, headers=headers, files=files, timeout=60)
-    logger.info(f"[WA UPLOAD] status={resp.status_code} body={resp.text[:200]}")
-    resp.raise_for_status()
-    return resp.json().get("id")
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            logger.info(f"[WA UPLOAD] attempt={attempt} audio_size={len(audio_bytes)} bytes")
+            files = {
+                "file": ("audio.mp3", audio_bytes, "audio/mpeg"),
+                "messaging_product": (None, "whatsapp"),
+                "type": (None, "audio/mpeg")
+            }
+            resp = requests.post(url, headers=headers, files=files, timeout=60)
+            logger.info(f"[WA UPLOAD] status={resp.status_code} body={resp.text[:300]}")
+            resp.raise_for_status()
+            media_id = resp.json().get("id")
+            if not media_id:
+                raise ValueError(f"WhatsApp 上傳返回空 media_id: {resp.text[:200]}")
+            logger.info(f"[WA UPLOAD] 成功 media_id={media_id} (attempt={attempt})")
+            return media_id
+        except Exception as e:
+            last_error = e
+            logger.error(f"[WA UPLOAD] attempt={attempt} 失敗: {type(e).__name__}: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(2)
+
+    raise last_error
 
 
 def send_whatsapp_audio(to: str, media_id: str) -> dict:
-    """發送語音訊息"""
+    """發送語音訊息（失敗自動重試一次）"""
     url = f"{WA_API_BASE}/messages"
     headers = {
         "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
@@ -293,9 +310,34 @@ def send_whatsapp_audio(to: str, media_id: str) -> dict:
         "type": "audio",
         "audio": {"id": media_id}
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=30)
-    logger.info(f"[WA AUDIO] to={to} status={resp.status_code} resp={resp.text[:200]}")
-    return resp.json()
+
+    last_error = None
+    for attempt in range(1, 3):
+        try:
+            logger.info(f"[WA AUDIO] attempt={attempt} to={to} media_id={media_id}")
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            logger.info(f"[WA AUDIO] to={to} status={resp.status_code} resp={resp.text[:300]}")
+            result = resp.json()
+            if "messages" in result:
+                logger.info(f"[WA AUDIO] 發送成功 to={to} msg_id={result['messages'][0].get('id', '')} (attempt={attempt})")
+                return result
+            # 如果有錯誤且不是窗口錯誤，才重試
+            err_code = result.get("error", {}).get("code", 0)
+            err_msg = result.get("error", {}).get("message", "")
+            is_window_error = err_code in (131047, 131026, 131028) or \
+                any(kw in err_msg.lower() for kw in ["24", "window", "session", "outside"])
+            if is_window_error:
+                logger.warning(f"[WA AUDIO] 窗口錯誤，不重試 to={to} code={err_code}")
+                return result  # 窗口錯誤不用重試
+            raise ValueError(f"WhatsApp 發送失敗: {err_msg} (code={err_code})")
+        except Exception as e:
+            last_error = e
+            logger.error(f"[WA AUDIO] attempt={attempt} 失敗: {type(e).__name__}: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(2)
+
+    raise last_error
 
 
 def format_phone_display(number: str) -> str:
@@ -387,7 +429,7 @@ def call_gemini(user_message: str, user_id: str) -> str:
 # ─── MiniMax TTS ─────────────────────────────────────────────────────────────
 
 def text_to_speech(text: str) -> bytes:
-    """使用 MiniMax TTS 生成廣東話語音，返回 MP3 bytes"""
+    """使用 MiniMax TTS 生成廣東話語音，返回 MP3 bytes（失敗自動重試一次）"""
     headers = {
         "Authorization": f"Bearer {MINIMAX_API_KEY}",
         "Content-Type": "application/json"
@@ -408,17 +450,37 @@ def text_to_speech(text: str) -> bytes:
         },
         "language_boost": "Chinese,Yue"
     }
-    resp = requests.post(MINIMAX_ENDPOINT, headers=headers, json=payload, timeout=90)
-    resp.raise_for_status()
-    data = resp.json()
 
-    audio_hex = data.get("data", {}).get("audio", "")
-    if not audio_hex:
-        raise ValueError(f"MiniMax TTS 返回空音頻: {json.dumps(data)[:300]}")
+    last_error = None
+    for attempt in range(1, 3):  # 最多嘗試2次
+        try:
+            logger.info(f"[TTS] 嘗試生成語音 attempt={attempt} text_len={len(text)} voice={MINIMAX_VOICE_ID}")
+            resp = requests.post(MINIMAX_ENDPOINT, headers=headers, json=payload, timeout=90)
+            logger.info(f"[TTS] API 回應 status={resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
 
-    audio_bytes = bytes.fromhex(audio_hex)
-    logger.info(f"[TTS] 生成音頻 {len(audio_bytes)} bytes")
-    return audio_bytes
+            # 檢查 base_resp
+            base_resp = data.get("base_resp", {})
+            if base_resp.get("status_code", 0) != 0:
+                raise ValueError(f"MiniMax API 錯誤: {base_resp.get('status_msg', '')} (code={base_resp.get('status_code')})")
+
+            audio_hex = data.get("data", {}).get("audio", "")
+            if not audio_hex:
+                raise ValueError(f"MiniMax TTS 返回空音頻: {json.dumps(data, ensure_ascii=False)[:300]}")
+
+            audio_bytes = bytes.fromhex(audio_hex)
+            logger.info(f"[TTS] 生成成功 {len(audio_bytes)} bytes (attempt={attempt})")
+            return audio_bytes
+
+        except Exception as e:
+            last_error = e
+            logger.error(f"[TTS] attempt={attempt} 失敗: {type(e).__name__}: {e}")
+            if attempt < 2:
+                import time
+                time.sleep(3)  # 等叶3秒後重試
+
+    raise last_error
 
 
 # ─── 工具函數 ─────────────────────────────────────────────────────────────────
@@ -888,7 +950,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.8.2",
+        "version": "2.8.3",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
