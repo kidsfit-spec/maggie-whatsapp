@@ -1,5 +1,5 @@
 """
-Maggie WhatsApp 溝通系統 v2.7.0
+Maggie WhatsApp 溝通系統 v2.9.6
 KIDS FIT
 
 對話狀態機：
@@ -15,7 +15,7 @@ KIDS FIT
   非白名單：
     發任何訊息 → 轉發給大王（不回覆對方）
 
-v2.7.0 修正：
+v2.9.6 修正：
   - 使用文件持久化狀態（/tmp/maggie_states.json），防止進程重啟丟失
   - AWAITING_NUMBER 狀態下支持多號碼（「93365596 同 95068886」）
   - 加入 threading.Lock 確保狀態讀寫線程安全
@@ -95,7 +95,46 @@ STATE_AWAITING_NUMBER = "awaiting_number"
 
 STATE_FILE = "/tmp/maggie_states.json"
 HISTORY_FILE = "/tmp/maggie_history.json"
+PROCESSED_MSG_FILE = "/tmp/maggie_processed_msgs.json"
 _state_lock = threading.Lock()
+_processed_lock = threading.Lock()
+
+def _load_processed_msgs() -> dict:
+    try:
+        if os.path.exists(PROCESSED_MSG_FILE):
+            with open(PROCESSED_MSG_FILE, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.error(f"[PROCESSED LOAD ERROR] {e}")
+    return {}
+
+def _save_processed_msgs(msgs: dict):
+    try:
+        with open(PROCESSED_MSG_FILE, "w") as f:
+            json.dump(msgs, f)
+    except Exception as e:
+        logger.error(f"[PROCESSED SAVE ERROR] {e}")
+
+def is_message_processed(msg_id: str) -> bool:
+    if not msg_id:
+        return False
+    with _processed_lock:
+        msgs = _load_processed_msgs()
+        now = datetime.now().timestamp()
+        
+        # Clean up old messages (older than 5 minutes)
+        to_delete = [k for k, v in msgs.items() if now - v > 300]
+        for k in to_delete:
+            del msgs[k]
+            
+        if msg_id in msgs:
+            _save_processed_msgs(msgs) # Save cleanup
+            return True
+            
+        msgs[msg_id] = now
+        _save_processed_msgs(msgs)
+        return False
+
 
 def _load_states() -> dict:
     """從文件載入所有用戶狀態"""
@@ -1193,7 +1232,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.9.5",
+        "version": "2.9.6",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
@@ -1239,6 +1278,13 @@ def webhook_receive():
             return jsonify({"status": "ok"}), 200
 
         for msg in messages:
+            msg_id = msg.get("id", "")
+            
+            # Deduplication check
+            if msg_id and is_message_processed(msg_id):
+                logger.info(f"[WEBHOOK] 忽略重複訊息: msg_id={msg_id}")
+                continue
+                
             from_number = msg.get("from", "")
             msg_type = msg.get("type", "")
 
