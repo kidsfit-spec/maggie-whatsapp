@@ -447,6 +447,76 @@ def call_gemini(user_message: str, user_id: str) -> str:
 
 # ─── MiniMax TTS ─────────────────────────────────────────────────────────────
 
+def preprocess_tts_text(text: str) -> str:
+    """
+    TTS 前文字預處理：將英文符號/格式轉換為粵語友好格式
+    - "$14,000" → "一萬四千蚊"
+    - "$1,460" → "一千四百六十蚊"
+    - "$250" → "二百五十蚊"
+    """
+    import re
+
+    def amount_to_cantonese(amount_str: str) -> str:
+        """將數字金額轉換為粵語讀法"""
+        # 移除逗號，轉為整數
+        try:
+            num = int(amount_str.replace(',', ''))
+        except ValueError:
+            return amount_str + '蚊'
+
+        if num == 0:
+            return '零蚊'
+
+        digits = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+        result = ''
+
+        yi = num // 100000000  # 億
+        wan = (num % 100000000) // 10000  # 萬
+        qian = (num % 10000) // 1000  # 千
+        bai = (num % 1000) // 100  # 百
+        shi = (num % 100) // 10  # 十
+        ge = num % 10  # 個位
+
+        if yi > 0:
+            result += digits[yi] + '億'
+        if wan > 0:
+            result += digits[wan] + '萬'
+        elif yi > 0 and (qian + bai + shi + ge) > 0:
+            result += '零'
+        if qian > 0:
+            result += digits[qian] + '千'
+        elif wan > 0 and (bai + shi + ge) > 0 and qian == 0:
+            result += '零'
+        if bai > 0:
+            result += digits[bai] + '百'
+        elif qian > 0 and (shi + ge) > 0 and bai == 0:
+            result += '零'
+        if shi > 0:
+            if shi == 1 and not result:  # 十幾
+                result += '十'
+            else:
+                result += digits[shi] + '十'
+        elif bai > 0 and ge > 0 and shi == 0:
+            result += '零'
+        if ge > 0:
+            result += digits[ge]
+
+        return result + '蚊'
+
+    # 匹配 $X,XXX 或 $XXX 格式（含小數）
+    def replace_dollar(m):
+        amount = m.group(1)  # 數字部分（可能含逗號）
+        if '.' in amount:
+            # 有小數：直接用數字+蚊，例如 $14.5 → 14.5蚊
+            return amount + '蚊'
+        return amount_to_cantonese(amount)
+
+    # 替換 $X,XXX 或 $XXX
+    text = re.sub(r'\$([\d,]+(?:\.\d+)?)', replace_dollar, text)
+
+    return text
+
+
 def text_to_speech(text: str) -> bytes:
     """使用 MiniMax TTS 生成廣東話語音，返回 MP3 bytes（失敗自動重試一次）"""
     headers = {
@@ -876,7 +946,7 @@ def _handle_direct_tts(from_number: str, text: str) -> bool:
     send_whatsapp_text(from_number, "正在直接生成語音...")
 
     try:
-        audio_bytes = text_to_speech(content)
+        audio_bytes = text_to_speech(preprocess_tts_text(content))
         media_id = upload_whatsapp_audio(audio_bytes)
 
         if target_numbers:
@@ -1000,8 +1070,8 @@ def _execute_generate_and_send(from_number: str):
     send_whatsapp_text(from_number, "正在生成語音...")
 
     try:
-        # 生成廣東話語音
-        audio_bytes = text_to_speech(rewritten_text)
+        # 生成廣東話語音（先預處理文字）
+        audio_bytes = text_to_speech(preprocess_tts_text(rewritten_text))
 
         # 上傳到 WhatsApp
         media_id = upload_whatsapp_audio(audio_bytes)
@@ -1073,7 +1143,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.9.2",
+        "version": "2.9.3",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
