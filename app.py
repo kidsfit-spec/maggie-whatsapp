@@ -442,7 +442,7 @@ def call_gemini(user_message: str, user_id: str) -> str:
                 import time
                 time.sleep(3)
 
-    raise RuntimeError(f"OpenAI GPT 調用失敗：{type(e).__name__}: {str(last_error)[:150]}") from last_error
+    raise RuntimeError(f"OpenAI GPT 調用失敗：{type(last_error).__name__}: {str(last_error)[:150]}") from last_error
 
 
 # ─── MiniMax TTS ─────────────────────────────────────────────────────────────
@@ -1073,7 +1073,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.9.1",
+        "version": "2.9.2",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
