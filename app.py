@@ -346,6 +346,32 @@ def send_whatsapp_audio(to: str, media_id: str) -> dict:
     raise last_error
 
 
+def send_whatsapp_document(to: str, media_id: str, filename: str) -> dict:
+    """發送文件訊息（document 類型，方便下載保存）"""
+    url = f"{WA_API_BASE}/messages"
+    headers = {
+        "Authorization": f"Bearer {WA_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "document",
+        "document": {
+            "id": media_id,
+            "filename": filename
+        }
+    }
+    try:
+        logger.info(f"[WA DOC] to={to} filename={filename} media_id={media_id}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        logger.info(f"[WA DOC] to={to} status={resp.status_code} resp={resp.text[:200]}")
+        return resp.json()
+    except Exception as e:
+        logger.error(f"[WA DOC] 發送失敗: {e}")
+        return {}
+
+
 def format_phone_display(number: str) -> str:
     """格式化電話號碼顯示，例如 85268993194 → +852 6899 3194"""
     n = number.lstrip("+")
@@ -1103,6 +1129,15 @@ def _execute_generate_and_send(from_number: str):
             # 副本給大王（無論成功失敗都發）
             send_whatsapp_audio(from_number, media_id)
             logger.info(f"[SEND COPY TO DAWANG] to={from_number}")
+            # 同時發送 MP3 文件給大王方便下載
+            from datetime import datetime
+            import pytz
+            hk_tz = pytz.timezone('Asia/Hong_Kong')
+            ts = datetime.now(hk_tz).strftime('%Y%m%d_%H%M')
+            doc_filename = f"maggie_voice_{ts}.mp3"
+            doc_media_id = upload_whatsapp_audio(audio_bytes)  # 重新上傳取得新 media_id
+            send_whatsapp_document(from_number, doc_media_id, doc_filename)
+            logger.info(f"[SEND DOC TO DAWANG] filename={doc_filename}")
 
             # 通知結果
             msg_parts = []
@@ -1125,6 +1160,15 @@ def _execute_generate_and_send(from_number: str):
         else:
             # 非大王 或 大王沒有指定目標號碼：發回本人
             send_whatsapp_audio(from_number, media_id)
+            # 同時發送 MP3 文件方便下載
+            from datetime import datetime
+            import pytz
+            hk_tz = pytz.timezone('Asia/Hong_Kong')
+            ts = datetime.now(hk_tz).strftime('%Y%m%d_%H%M')
+            doc_filename = f"maggie_voice_{ts}.mp3"
+            doc_media_id = upload_whatsapp_audio(audio_bytes)  # 重新上傳取得新 media_id
+            send_whatsapp_document(from_number, doc_media_id, doc_filename)
+            logger.info(f"[SEND DOC] to={from_number} filename={doc_filename}")
             send_whatsapp_text(from_number, "語音已生成，發回俾你。")
 
         # 更新對話歷史
@@ -1149,7 +1193,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.9.4",
+        "version": "2.9.5",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
