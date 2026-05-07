@@ -415,15 +415,23 @@ def call_gemini(user_message: str, user_id: str) -> str:
         parts=[types.Part(text=user_message)]
     ))
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=MAGGIE_SYSTEM_PROMPT,
-            temperature=0.7,
-        ),
-        contents=contents
-    )
-    return response.text
+    try:
+        logger.info(f"[GEMINI] 呼叫 Gemini 模型 user={user_id} msg_len={len(user_message)}")
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            config=types.GenerateContentConfig(
+                system_instruction=MAGGIE_SYSTEM_PROMPT,
+                temperature=0.7,
+                http_options=types.HttpOptions(timeout=60000)  # 60 秒 timeout
+            ),
+            contents=contents
+        )
+        result = response.text
+        logger.info(f"[GEMINI] 回應成功 len={len(result)}")
+        return result
+    except Exception as e:
+        logger.error(f"[GEMINI ERROR] {type(e).__name__}: {e}")
+        raise RuntimeError(f"Gemini AI 調用失敗：{type(e).__name__}: {str(e)[:150]}") from e
 
 
 # ─── MiniMax TTS ─────────────────────────────────────────────────────────────
@@ -806,6 +814,89 @@ def _handle_direct_text(from_number: str, text: str) -> bool:
     return True
 
 
+def _handle_direct_tts(from_number: str, text: str) -> bool:
+    """
+    檢查是否為「直接生成語音」指令（跳過 Gemini 改寫）。
+    格式：「直接生成 / 直接語音 / direct」+ [可選號碼] + 內容
+    如果符合，直接 TTS 生成語音，返回 True；否則返回 False。
+    """
+    m = re.match(
+        r'^(?:直接生成|直接語音|direct)\s+(.+)$',
+        text.strip(), re.IGNORECASE | re.DOTALL
+    )
+    if not m:
+        return False
+
+    rest = m.group(1).strip()
+
+    # 嘗試從開頭提取號碼（可選）
+    target_numbers = []
+    content = rest
+    phone_m = re.match(r'^(?:\+?852)?([235689]\d{7})\s+(.+)$', rest, re.DOTALL)
+    if phone_m:
+        target_numbers = ["852" + phone_m.group(1)]
+        content = phone_m.group(2).strip()
+    else:
+        # 嘗試提取多個號碼
+        phones = extract_multiple_phone_numbers(rest)
+        if phones:
+            target_numbers = phones
+            # 移除號碼，保留內容
+            content = re.sub(r'(?:\+?852)?[235689]\d{7}', '', rest).strip()
+            content = re.sub(r'^[\s同和,，、]+|[\s同和,，、]+$', '', content).strip()
+
+    if not content:
+        send_whatsapp_text(from_number, "大王，請提供要生成語音嘅文字內容。")
+        return True
+
+    logger.info(f"[DIRECT TTS] from={from_number} targets={target_numbers} content={content[:50]}")
+    send_whatsapp_text(from_number, "正在直接生成語音...")
+
+    try:
+        audio_bytes = text_to_speech(content)
+        media_id = upload_whatsapp_audio(audio_bytes)
+
+        if target_numbers:
+            # 發到指定號碼 + 副本給大王
+            success_targets = []
+            failed_targets = []
+            for target in target_numbers:
+                target_display = format_phone_display(target)
+                result = send_whatsapp_audio(target, media_id)
+                if "messages" in result:
+                    success_targets.append(target_display)
+                else:
+                    err_code = result.get("error", {}).get("code", 0)
+                    err_msg = result.get("error", {}).get("message", "未知錯誤")
+                    failed_targets.append((target_display, err_code, err_msg))
+
+            # 副本給大王
+            send_whatsapp_audio(from_number, media_id)
+
+            msg_parts = []
+            if success_targets:
+                msg_parts.append(f"大王，語音已直接發送到：{', '.join(success_targets)}")
+            for (disp, code, err) in failed_targets:
+                is_window = code in (131047, 131026, 131028) or \
+                    any(kw in err.lower() for kw in ["24", "window", "session", "outside"])
+                if is_window:
+                    msg_parts.append(f"大王，語音發送到 {disp} 失敗。對方未開啟對話窗口，請叫對方先發一條訊息到 95789829。")
+                else:
+                    msg_parts.append(f"大王，語音發送到 {disp} 失敗：{err[:80]}")
+            if msg_parts:
+                send_whatsapp_text(from_number, "\n".join(msg_parts))
+        else:
+            # 只發回大王
+            send_whatsapp_audio(from_number, media_id)
+            send_whatsapp_text(from_number, "大王，語音已生成並發回給你。")
+
+    except Exception as e:
+        logger.error(f"[DIRECT TTS ERROR] {type(e).__name__}: {e}", exc_info=True)
+        send_whatsapp_text(from_number, f"大王，語音生成失敗：{str(e)[:100]}")
+
+    return True
+
+
 def _handle_new_message(from_number: str, text: str):
     """處理新的改寫請求，同時嘗試提取目標號碼"""
 
@@ -818,6 +909,10 @@ def _handle_new_message(from_number: str, text: str):
 
     # 大王專用：文字直接回覆指令（不經改寫）
     if from_number == DAWANG_NUMBER and _handle_direct_text(from_number, text):
+        return
+
+    # 大王專用：直接生成語音指令（跳過 Gemini 改寫）
+    if from_number == DAWANG_NUMBER and _handle_direct_tts(from_number, text):
         return
 
     # 嘗試從訊息中提取目標號碼（大王專用）
@@ -841,8 +936,13 @@ def _handle_new_message(from_number: str, text: str):
             logger.info(f"[EXTRACT] 目標號碼={target_numbers} 內容={message_content[:50]}")
 
     # 呼叫 Gemini 改寫
-    prompt = f"大王想表達：「{message_content}」\n\n請用第一人稱「我」改寫為友善自然嘅廣東話語音稿。記住：語音稿係代表大王本人講嘅，唔可以出現第三人稱。"
-    gemini_reply = call_gemini(prompt, from_number)
+    prompt = f"大王想表達：「{message_content}」\n\n請用第一人稱「我」改寫為友善自然嘅廣東話語音稿。記住：語音稿係代表大王本人講噅，唄可以出現第三人稱。"
+    try:
+        gemini_reply = call_gemini(prompt, from_number)
+    except RuntimeError as e:
+        logger.error(f"[GEMINI FAIL] {e}")
+        send_whatsapp_text(from_number, f"大王，AI 改寫失敗：{str(e)[:120]}\n\n請稍後重試，或用「直接生成 內容」跳過改寫直接生成語音。")
+        return
 
     # 解析回覆
     voice_script, full_reply = parse_gemini_response(gemini_reply)
@@ -950,7 +1050,7 @@ def index():
         "service": "Maggie WhatsApp 溝通系統",
         "description": "KIDS FIT AI 溝通助手 Maggie",
         "status": "running",
-        "version": "2.8.3",
+        "version": "2.8.4",
         "flow": {
             "大王": "發訊息（含目標號碼）→ Maggie改寫 → 確認 → 直接發語音到對方 + 副本給大王",
             "85263951689": "發訊息 → Maggie改寫 → 確認 → 語音發回本人",
